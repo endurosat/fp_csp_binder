@@ -1,0 +1,22 @@
+/*
+ * SPDX-FileCopyrightText: 2026 ENDUROSAT EAD
+ * SPDX-License-Identifier: LicenseRef-EnduroSat-1.0
+ */
+
+/**
+ * @file csp_service_cfg.h
+ * @brief Project-level CSP configuration used by fp_csp_binder.
+ *
+ * Copy it into your project's include path as "csp_service_cfg.h". Your project may keep
+ * further CSP settings here; fp_csp_binder only needs CSP_SERVICE_CFG_BUFFER_SZ.
+ */
+
+#ifndef CSP_SERVICE_CFG_H
+#define CSP_SERVICE_CFG_H
+
+/** @brief Size in bytes of the FP response buffer of each server thread
+ *  (used by FS_MAX_CSP_BUF_SZ_BYTES in fp_csp_binder_cfg.h). It should not exceed
+ *  the CSP packet buffer size configured in csp-es (CSP_BUFFER_SIZE). */
+#define CSP_SERVICE_CFG_BUFFER_SZ (256)
+
+#endif /* CSP_SERVICE_CFG_H */

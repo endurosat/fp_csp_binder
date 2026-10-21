@@ -1,0 +1,20 @@
+/*
+ * SPDX-FileCopyrightText: 2026 ENDUROSAT EAD
+ * SPDX-License-Identifier: LicenseRef-EnduroSat-1.0
+ */
+
+/**
+ * @file csp_access.h
+ * @brief Project-level access header for the CSP library.
+ *
+ * fp_csp_binder.h includes this file to get the CSP types and functions. Copy it into
+ * your project's include path as "csp_access.h". If your project wraps CSP (e.g. adds
+ * locking or its own CSP service layer), include that wrapper here instead.
+ */
+
+#ifndef CSP_ACCESS_H
+#define CSP_ACCESS_H
+
+#include "csp/csp.h"
+
+#endif /* CSP_ACCESS_H */

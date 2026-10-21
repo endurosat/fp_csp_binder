@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/endurosat/fp_csp_binder/security/advisories/new
+    about: Report security issues privately, never in a public issue.
+  - name: Commercial and product enquiries
+    url: https://www.endurosat.com/contact/
+    about: Questions about EnduroSat products and services.
