@@ -139,7 +139,7 @@ static fp_session_track_action_t fp_csp_binder_session_track_handler(fp_disp_ses
                        (unsigned)p_client_resp_pkt->id.src,
                        csp_conn_sport(p_csp_params->p_active_conn));
 
-        // F1: reject packets whose source node doesn't match the configured server
+        // Anti-spoofing: reject packets whose source node doesn't match the configured server
         if ((int)p_csp_params->dest != (int)p_client_resp_pkt->id.src)
         {
             ES_TRACE_WARN("<A< src mismatch: expected=%u got=%u — dropping frame",

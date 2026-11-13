@@ -244,7 +244,7 @@ typedef struct {
     uint8_t     dport;         /* destination node port */
     uint32_t    timeout;       /* milliseconds to wait; overwritten by the binder */
     uint32_t    opts;          /* connection options (e.g. CSP_O_CRC32) */
-    csp_conn_t *p_active_conn; /* leave NULL — the binder owns this field */
+    csp_conn_t *p_active_conn; /* leave NULL — the binder owns this field; reading it is fine */
     void       *p_user_args;   /* optional: pass anything you need in callbacks */
 } fp_csp_binder_params_t;
 
@@ -355,14 +355,14 @@ fp_cmd_status_t my_service_read_value(uint32_t *p_out_value)
 
 Use this form when you do not need to block the calling task, for example when periodically polling telemetry from several nodes in a loop. The call returns immediately; the response arrives later in a callback you provide.
 
-Because the call returns before the reply is received, the `fp_csp_binder_params_t` and `fp_dispatch_info_t` **must remain valid until the callback fires**. The usual pattern is to keep these in a small pre-allocated pool and use an `in_use` flag — set before the call, cleared in the callback — to prevent a slot from being reused too early.
+Because the call returns before the reply is received, the `fp_csp_binder_params_t` and `fp_dispatch_info_t` **must remain valid until the callback fires**. The usual pattern is to keep these in a small pre-allocated pool and use an `in_use` flag — set before the call, cleared in the callback — to prevent a slot from being reused too early. The flag alone is not enough: the callback runs **before** the binder closes the CSP connection and clears `p_active_conn`. A slot reused in that window loses its connection, which then stays open for good. Treat a slot as free only when `in_use` is false **and** `p_active_conn` is `NULL`.
 
 #### Async request steps
 
-1. Obtain a free slot from a pool that holds `fp_csp_binder_params_t`, `fp_dispatch_info_t`, and an `in_use` flag.
+1. Obtain a free slot from a pool that holds `fp_csp_binder_params_t`, `fp_dispatch_info_t`, and an `in_use` flag. Free means `in_use` is false and `csp_params.p_active_conn` is `NULL`.
 2. Fill the slot's `csp_params`; set `p_user_args` to point to the `in_use` flag.
 3. Call `fp_csp_binder_req_async`, passing `&p_ctx->disp_ctx` as the dispatch context argument, and the response handler callback.
-4. In the callback: process the response, then clear the `in_use` flag to release the slot.
+4. In the callback: process the response, then clear the `in_use` flag. The binder closes the connection and clears `p_active_conn` after the callback returns; only then is the slot free.
 
 #### Pool element definition
 
@@ -370,18 +370,25 @@ Because the call returns before the reply is received, the `fp_csp_binder_params
 typedef struct {
     bool                   in_use;
     fp_csp_binder_params_t csp_params;
-    fp_dispatch_info_t     disp_ctx;     /* zeroed by the pool memset below */
+    fp_dispatch_info_t     disp_ctx;
     fp_my_service_get_telemetry_req_data_t req_data;  /* request data must also outlive the call */
 } my_csp_ctx_t;
 
 #define MY_POOL_SIZE 4u
+/* Static storage, so zero-initialised: every slot starts free (in_use false, p_active_conn NULL).
+ * A pool on the stack or heap must be zeroed before first use. */
 static my_csp_ctx_t ctx_pool[MY_POOL_SIZE];
 
 static my_csp_ctx_t *get_free_slot(void)
 {
     for (uint8_t i = 0; i < MY_POOL_SIZE; i++)
     {
-        if (!ctx_pool[i].in_use)
+        /* in_use alone is not enough: the binder clears p_active_conn only
+         * after the callback, once it has closed the connection. On a
+         * single-core target the unlocked read is safe: a stale non-NULL value
+         * only makes the slot look busy. On a multi-core host, read both
+         * fields atomically or under a lock. */
+        if (!ctx_pool[i].in_use && (NULL == ctx_pool[i].csp_params.p_active_conn))
         {
             return &ctx_pool[i];
         }
@@ -406,7 +413,7 @@ void my_service_telemetry_handler(fp_dispatch_info_t            *p_disp_ctx,
         (void)p_resp->voltage;
     }
 
-    /* Release the pool slot so it can be reused */
+    /* Release the pool slot; it is reusable once the binder has also cleared p_active_conn */
     if (NULL != p_disp_ctx && NULL != p_disp_ctx->p_comm_params)
     {
         fp_csp_binder_params_t *p_csp = p_disp_ctx->p_comm_params;
@@ -440,7 +447,7 @@ void my_service_poll_telemetry(void)
     p_ctx->csp_params.dport         = MY_DEST_PORT;
     p_ctx->csp_params.timeout       = MY_TIMEOUT_MS;
     p_ctx->csp_params.opts          = CSP_O_CRC32;
-    p_ctx->csp_params.p_active_conn = NULL;             /* always NULL */
+    p_ctx->csp_params.p_active_conn = NULL;             /* already NULL: get_free_slot only returns closed slots */
     p_ctx->csp_params.p_user_args   = &p_ctx->in_use;  /* callback uses this to free the slot */
 
     /* Step 3 — non-blocking call */
@@ -519,7 +526,7 @@ fp_cmd_status_t my_service_broadcast_status(uint32_t status_code)
 
 ### Common pitfalls
 
-- **Leave `p_active_conn = NULL`.** The binder owns this field: it resets it on every call and uses it while a request is in progress. Do not write it while an asynchronous request is pending.
+- **Leave `p_active_conn = NULL`.** The binder owns this field: it resets it on every call and uses it while a request is in progress. Do not write it while an asynchronous request is pending. Reading it to check that a pool slot is free is expected (see `get_free_slot`).
 
 - **Check the return value of every call.**
   - `FP_CMD_STATUS_SENDERR`: the request could not be sent (for example no CSP buffer or connection), or a synchronous request got no valid response before the timeout.
@@ -527,7 +534,7 @@ fp_cmd_status_t my_service_broadcast_status(uint32_t status_code)
   - `FP_CMD_STATUS_NO_MEM`: no free FP client session; raise `MAX_CLIENT_SESSIONS_COUNT` in `fp_config.h` if requests overlap.
   - `FP_CMD_STATUS_INVARGS`: `p_csp_params`, the request function or `p_disp_ctx` is NULL. This is only returned if `BREAK_ASSERT` does not halt.
 
-- **Async: keep the pool slot alive until the callback.** Once `fp_csp_binder_req_async` returns `FP_CMD_STATUS_NOERROR`, do not touch or reuse the slot until the callback clears the `in_use` flag. If the call fails, clear the flag immediately (as shown above). The callback runs only if your application calls `fp_disp_session_mgr_track_sessions()` periodically (see [Initialisation](#initialisation)).
+- **Async: keep the pool slot alive until the callback.** Once `fp_csp_binder_req_async` returns `FP_CMD_STATUS_NOERROR`, do not touch or reuse the slot until the callback clears the `in_use` flag **and** the binder clears `p_active_conn`; check both, as `get_free_slot` above does. If the call fails, clear the flag immediately (as shown above). The callback runs only if your application calls `fp_disp_session_mgr_track_sessions()` periodically (see [Initialisation](#initialisation)).
 
 - **Synchronous calls can use the stack.** A local `fp_csp_binder_params_t` and `fp_dispatch_info_t` are fine for synchronous and broadcast calls, because the call returns only when it is done. Asynchronous calls need storage that outlives the call, such as the pool described above.
 

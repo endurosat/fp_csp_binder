@@ -19,6 +19,13 @@ target_link_libraries(fp_adversarial PRIVATE
     pthread
 )
 
+# T4 counts connection opens and closes through these wrappers (src/main.c)
+target_link_options(fp_adversarial PRIVATE
+    "LINKER:--wrap=csp_connect"
+    "LINKER:--wrap=csp_accept"
+    "LINKER:--wrap=csp_close"
+)
+
 set_target_properties(fp_adversarial PROPERTIES
     C_STANDARD 11
     C_STANDARD_REQUIRED ON

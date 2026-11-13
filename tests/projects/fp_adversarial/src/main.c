@@ -8,6 +8,9 @@
  * T1 — F1 (spoofing), sync path   — MUST FAIL before fix
  * T2 — F2 (DoS stray frame), sync — MUST FAIL before fix
  * T3 — F1 (spoofing), async path  — MUST FAIL before fix
+ * T4 — sync path closes its connection exactly once
+ * T5 — async path: after the callback the binder closes the connection once, then clears
+ *      p_active_conn (reply and timeout cases)
  */
 
 #include <stdio.h>
@@ -17,6 +20,7 @@
 #include <pthread.h>
 #include <semaphore.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <time.h>
 
 #include "csp/csp.h"
@@ -90,6 +94,99 @@ static atomic_int            g_server_handler_fired = ATOMIC_VAR_INIT(0);
 
 /* Shared csp_params so attacker can read p_active_conn → sport after open */
 static fp_csp_binder_params_t g_client_csp_params;
+
+/* -----------------------------------------------------------------------
+ * Connection lifecycle tracking (linked with -Wl,--wrap=csp_connect,
+ * --wrap=csp_accept,--wrap=csp_close; see CMakeLists.txt).
+ * A connection is recorded as open when csp_connect or csp_accept returns it.
+ * A csp_close of a connection that is not open counts as a double close: once
+ * libcsp reuses the slot, such a close would end another user's connection.
+ * ----------------------------------------------------------------------- */
+#define CONN_TRACK_MAX (64U)
+
+static pthread_mutex_t   g_conn_track_lock = PTHREAD_MUTEX_INITIALIZER;
+static const csp_conn_t *g_open_conns[CONN_TRACK_MAX];
+static atomic_int        g_double_close_cnt = ATOMIC_VAR_INIT(0);
+
+csp_conn_t *__real_csp_connect(uint8_t prio, uint16_t dst, uint8_t dst_port, uint32_t timeout, uint32_t opts);
+csp_conn_t *__real_csp_accept(csp_socket_t *socket, uint32_t timeout);
+int         __real_csp_close(csp_conn_t *conn);
+
+csp_conn_t *__wrap_csp_connect(uint8_t prio, uint16_t dst, uint8_t dst_port, uint32_t timeout, uint32_t opts);
+csp_conn_t *__wrap_csp_accept(csp_socket_t *socket, uint32_t timeout);
+int         __wrap_csp_close(csp_conn_t *conn);
+
+static void conn_track_open(const csp_conn_t *conn)
+{
+    if (NULL == conn) { return; }
+
+    pthread_mutex_lock(&g_conn_track_lock);
+    for (uint32_t i = 0; i < CONN_TRACK_MAX; i++)
+    {
+        if (NULL == g_open_conns[i])
+        {
+            g_open_conns[i] = conn;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_conn_track_lock);
+}
+
+/* Returns true when conn was open (and marks it closed). */
+static bool conn_track_close(const csp_conn_t *conn)
+{
+    bool was_open = false;
+
+    pthread_mutex_lock(&g_conn_track_lock);
+    for (uint32_t i = 0; i < CONN_TRACK_MAX; i++)
+    {
+        if (conn == g_open_conns[i])
+        {
+            g_open_conns[i] = NULL;
+            was_open        = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_conn_track_lock);
+
+    return was_open;
+}
+
+csp_conn_t *__wrap_csp_connect(uint8_t prio, uint16_t dst, uint8_t dst_port, uint32_t timeout, uint32_t opts)
+{
+    csp_conn_t *conn = __real_csp_connect(prio, dst, dst_port, timeout, opts);
+    conn_track_open(conn);
+    return conn;
+}
+
+csp_conn_t *__wrap_csp_accept(csp_socket_t *socket, uint32_t timeout)
+{
+    csp_conn_t *conn = __real_csp_accept(socket, timeout);
+    conn_track_open(conn);
+    return conn;
+}
+
+/* T5 ordering probe: the params under test, and whether their connection was closed
+ * while p_active_conn still pointed to it (close before clear). */
+static fp_csp_binder_params_t *volatile g_t5_params        = NULL;
+static atomic_int                       g_t5_closed_while_set = ATOMIC_VAR_INIT(0);
+
+int __wrap_csp_close(csp_conn_t *conn)
+{
+    fp_csp_binder_params_t *const p_t5 = g_t5_params;
+    if ((NULL != p_t5) && (NULL != conn) && (conn == p_t5->p_active_conn))
+    {
+        atomic_store(&g_t5_closed_while_set, 1);
+    }
+
+    /* Untrack before the real close: libcsp cannot hand the slot out again until it is closed. */
+    if ((NULL != conn) && !conn_track_close(conn))
+    {
+        atomic_fetch_add(&g_double_close_cnt, 1);
+        printf("[ADV] double close of connection %p\n", (void *)conn);
+    }
+    return __real_csp_close(conn);
+}
 
 /* -----------------------------------------------------------------------
  * FP server dispatch context
@@ -557,6 +654,207 @@ static int run_async_test(const char *name)
 }
 
 /* -----------------------------------------------------------------------
+ * T4: a synchronous request must close its connection exactly once.
+ * The sync path closes the connection after the response; it must then clear
+ * p_active_conn so the session close handler does not close it again.
+ * Returns 0 on PASS, non-zero on FAIL.
+ * ----------------------------------------------------------------------- */
+static int run_sync_close_test(const char *name)
+{
+    printf("\n[ADV] === %s ===\n", name);
+
+    atomic_store(&g_double_close_cnt, 0);
+
+    fp_dispatch_info_t     disp_ctx = { 0 };
+    fp_csp_binder_params_t params   = {
+        .prio          = CSP_PRIO_NORM,
+        .dest          = TEST_SERVER_NODE,
+        .dport         = TEST_SERVER_PORT,
+        .timeout       = REQUEST_TIMEOUT_MS,
+        .opts          = CSP_O_CRC32,
+        .p_active_conn = NULL
+    };
+
+    fp_config_user_assign_sys_context(&disp_ctx, FP_CONFIG_SYS_CTX_TYPE_CSP);
+
+    uint8_t req_buf[sizeof(fp_msg_hdr_t)] = { 0 };
+    uint8_t resp_buf[TEST_RESP_SIZE]      = { 0 };
+
+    fp_cmd_status_t res = fp_csp_binder_req_sync(FP_FRAME_TYPE_REQ, &params, test_send_req,
+                                                 &disp_ctx, req_buf, resp_buf, REQUEST_TIMEOUT_MS);
+
+    /* Let the server thread finish with its side of the connection, so its close is counted too. */
+    usleep(4U * SERVER_REPLY_HOLD_MS * 1000U);
+
+    const int double_closes = atomic_load(&g_double_close_cnt);
+    int       fail          = 0;
+
+    if (FP_CMD_STATUS_NOERROR != res)
+    {
+        printf("[ADV] %s FAIL: status=0x%02X (expected NOERROR)\n", name, (unsigned)res);
+        fail = 1;
+    }
+    if (0 != double_closes)
+    {
+        printf("[ADV] %s FAIL: %d double close(s)\n", name, double_closes);
+        fail = 1;
+    }
+    if (0 == fail)
+    {
+        printf("[ADV] %s PASS\n", name);
+    }
+
+    return fail;
+}
+
+/* -----------------------------------------------------------------------
+ * T5: the async slot-reuse contract an application pool relies on.
+ * The callback runs while the connection is still open; afterwards the binder
+ * closes it exactly once and only then clears p_active_conn. A pool that
+ * treats a slot as free when in_use is false and p_active_conn is NULL
+ * therefore never reuses a slot whose connection is still open, and never
+ * waits forever for one.
+ * ----------------------------------------------------------------------- */
+#define T5_UNBOUND_PORT        (11U)   /* no server: the request times out */
+#define T5_TIMEOUT_MS          (300U)
+#define T5_CLEAR_WAIT_MS       (500U)  /* > a few session-tracker periods */
+
+typedef struct {
+    sem_t                   done;
+    fp_cmd_status_t         status;
+    const csp_conn_t       *p_conn_in_cb;  /* p_active_conn seen inside the callback */
+} t5_result_t;
+
+static t5_result_t *g_t5_result = NULL;
+
+static void t5_resp_handler(void                 *p_disp_ctx,
+                            uint8_t              *p_untyped_resp,
+                            const fp_cmd_status_t cmd_status)
+{
+    (void)p_untyped_resp;
+    if (NULL == g_t5_result) { return; }
+
+    const fp_dispatch_info_t     *p_ctx    = (const fp_dispatch_info_t *)p_disp_ctx;
+    const fp_csp_binder_params_t *p_params = (NULL != p_ctx) ? (const fp_csp_binder_params_t *)p_ctx->p_comm_params : NULL;
+
+    g_t5_result->p_conn_in_cb = (NULL != p_params) ? p_params->p_active_conn : NULL;
+    g_t5_result->status       = cmd_status;
+    sem_post(&g_t5_result->done);
+}
+
+/* One async request; expect_status is the status the callback must report.
+ * Returns 0 on PASS, non-zero on FAIL. */
+static int run_async_close_case(const char *name, uint8_t dport, uint32_t timeout_ms,
+                                fp_cmd_status_t expect_status)
+{
+    printf("\n[ADV] === %s ===\n", name);
+
+    atomic_store(&g_double_close_cnt, 0);
+    atomic_store(&g_t5_closed_while_set, 0);
+
+    t5_result_t result = { .status = FP_CMD_STATUS_MAX, .p_conn_in_cb = NULL };
+    sem_init(&result.done, 0, 0);
+    g_t5_result = &result;
+
+    /* Static: the binder keeps using these after fp_csp_binder_req_async returns. */
+    static fp_dispatch_info_t     disp_ctx;
+    static fp_csp_binder_params_t params;
+    static uint8_t                req_buf[sizeof(fp_msg_hdr_t)];
+
+    memset(&disp_ctx, 0, sizeof(disp_ctx));
+    memset(&params, 0, sizeof(params));
+    memset(req_buf, 0, sizeof(req_buf));
+    params.prio    = CSP_PRIO_NORM;
+    params.dest    = TEST_SERVER_NODE;
+    params.dport   = dport;
+    params.timeout = timeout_ms;
+    params.opts    = CSP_O_CRC32;
+
+    fp_config_user_assign_sys_context(&disp_ctx, FP_CONFIG_SYS_CTX_TYPE_CSP);
+
+    g_t5_params = &params;
+
+    fp_cmd_status_t launch = fp_csp_binder_req_async(FP_FRAME_TYPE_REQ, &params, test_send_req_async,
+                                                     &disp_ctx, req_buf, t5_resp_handler, timeout_ms);
+
+    int fail = 0;
+
+    if (FP_CMD_STATUS_NOERROR != launch)
+    {
+        printf("[ADV] %s FAIL: launch status=0x%02X\n", name, (unsigned)launch);
+        fail = 1;
+    }
+    else
+    {
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec  += (timeout_ms + 1000U) / 1000U;
+        deadline.tv_nsec += (long)(((timeout_ms + 1000U) % 1000U) * 1000000L);
+        if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+
+        if (0 != sem_timedwait(&result.done, &deadline))
+        {
+            printf("[ADV] %s FAIL: callback never called\n", name);
+            fail = 1;
+        }
+        else
+        {
+            /* Wait for the binder to clear the pointer (it does so after the callback). */
+            uint32_t waited_ms = 0;
+            while ((NULL != __atomic_load_n(&params.p_active_conn, __ATOMIC_ACQUIRE)) && (waited_ms < T5_CLEAR_WAIT_MS))
+            {
+                usleep(1000);
+                waited_ms++;
+            }
+
+            if (expect_status != result.status)
+            {
+                printf("[ADV] %s FAIL: callback status=0x%02X (expected 0x%02X)\n",
+                       name, (unsigned)result.status, (unsigned)expect_status);
+                fail = 1;
+            }
+            if (NULL == result.p_conn_in_cb)
+            {
+                printf("[ADV] %s FAIL: p_active_conn already NULL inside the callback\n", name);
+                fail = 1;
+            }
+            if (NULL != params.p_active_conn)
+            {
+                printf("[ADV] %s FAIL: p_active_conn not cleared %u ms after the callback (slot never free)\n",
+                       name, (unsigned)T5_CLEAR_WAIT_MS);
+                fail = 1;
+            }
+            else if (0 == atomic_load(&g_t5_closed_while_set))
+            {
+                printf("[ADV] %s FAIL: p_active_conn cleared before its connection was closed\n", name);
+                fail = 1;
+            }
+        }
+    }
+
+    /* Let the server side finish, so a stray close is counted too. */
+    usleep(4U * SERVER_REPLY_HOLD_MS * 1000U);
+
+    const int double_closes = atomic_load(&g_double_close_cnt);
+    if (0 != double_closes)
+    {
+        printf("[ADV] %s FAIL: %d double close(s)\n", name, double_closes);
+        fail = 1;
+    }
+
+    g_t5_params = NULL;
+    g_t5_result = NULL;
+    sem_destroy(&result.done);
+
+    if (0 == fail)
+    {
+        printf("[ADV] %s PASS\n", name);
+    }
+
+    return fail;
+}
+
+/* -----------------------------------------------------------------------
  * CSP router thread: dequeues packets from csp_qfifo and delivers them.
  * Must run for any in-process CSP traffic to work (loopback included).
  * ----------------------------------------------------------------------- */
@@ -676,6 +974,11 @@ int main(void)
     failures += run_sync_test(0, "T1 (sync spoof / F1)");
     failures += run_sync_test(1, "T2 (sync DoS / F2)");
     failures += run_async_test("T3 (async spoof / F1 async path)");
+    failures += run_sync_close_test("T4 (sync path closes its connection once)");
+    failures += run_async_close_case("T5a (async reply: close once, then clear)",
+                                     TEST_SERVER_PORT, REQUEST_TIMEOUT_MS, FP_CMD_STATUS_NOERROR);
+    failures += run_async_close_case("T5b (async timeout: close once, then clear)",
+                                     T5_UNBOUND_PORT, T5_TIMEOUT_MS, FP_CMD_STATUS_TIMEOUT);
 
     if (failures > 0)
     {

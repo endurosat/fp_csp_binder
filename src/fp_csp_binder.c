@@ -176,10 +176,13 @@ static bool csp_fp_dispatch_rcvd_packet(csp_packet_t *p_pkt, fp_csp_binder_param
 
 /* === FP request/response cmd_id tracing =====================================================
  * Extract the FP iface/func/cmd_id from a packet payload via the packed fp_msg_hdr_t overlay
- * (cmd_id is the per-transaction tag the dual-bus dedup client stamps and the OBC echoes). Logged
- * on both request-in and response-out paths so a lost transaction can be localised:
- * RX-logged + TX-logged => loss is downstream in CSP/CAN TX (e.g. the bus-off mirror); RX-logged
- * only => no response produced; neither => the request never arrived. */
+ * (cmd_id is the per-transaction tag the client sets and the server echoes in its response).
+ * RX lines cover frames received on the server sockets. TX lines cover every frame sent on a
+ * connection: this node's responses and its own requests. Responses to this node's requests
+ * are read on the client paths and are not logged as RX.
+ * For a request this node serves, a lost transaction can be localised:
+ * RX-logged + TX-logged => loss is downstream in the CSP transmit path; RX-logged only => no
+ * response produced; neither => the request never arrived. */
 static void fp_diag_ids(const csp_packet_t *p_pkt, uint16_t *p_iface, uint32_t *p_func, uint16_t *p_cmd)
 {
     if ((NULL != p_pkt) && (p_pkt->length >= sizeof(fp_msg_hdr_t)))
@@ -195,6 +198,38 @@ static void fp_diag_ids(const csp_packet_t *p_pkt, uint16_t *p_iface, uint32_t *
         *p_func  = 0xFFFFFFFFU;
         *p_cmd   = 0xFFFFU;
     }
+}
+
+/* Frame kind from the packet's own FP header, so a log line says what was sent or received:
+ * the same send path carries this node's requests (client) and its responses (server). */
+static const char *fp_diag_kind(const csp_packet_t *p_pkt)
+{
+    const char *p_kind = "?";
+
+    if ((NULL != p_pkt) && (p_pkt->length >= sizeof(fp_msg_hdr_t)))
+    {
+        fp_proto_func_attr_t attr;
+        fp_proto_get_func_attributes((const fp_msg_hdr_t *)p_pkt->data, &attr);
+
+        if (FP_FRAME_TYPE_RESP == attr.frame_type)
+        {
+            p_kind = "resp";
+        }
+        else if (FP_FRAME_TYPE_BROADCAST == attr.frame_type)
+        {
+            p_kind = "bcast";
+        }
+        else if (attr.frame_type < FP_FRAME_TYPE_RESP)
+        {
+            p_kind = "req";
+        }
+        else
+        {
+            /* invalid frame type: keep "?" */
+        }
+    }
+
+    return p_kind;
 }
 
 void fp_csp_binder_rx_thread_func(void *p_args)
@@ -221,8 +256,8 @@ void fp_csp_binder_rx_thread_func(void *p_args)
                 uint32_t rx_fn;
                 uint16_t rx_cmd;
                 fp_diag_ids(p_rpacket, &rx_if, &rx_fn, &rx_cmd);
-                ES_TRACE_INFO("[%s] RX req len=%u iface=%u func=0x%08lx cmd_id=%u",
-                              p_server_cfg->p_cfg_name, p_rpacket->length,
+                ES_TRACE_INFO("[%s] RX %s len=%u iface=%u func=0x%08lx cmd_id=%u",
+                              p_server_cfg->p_cfg_name, fp_diag_kind(p_rpacket), p_rpacket->length,
                               (unsigned)rx_if, (unsigned long)rx_fn, (unsigned)rx_cmd);
 
                 csp_fp_dispatch_rcvd_packet(p_rpacket, &p_server_cfg->csp_params);
@@ -282,12 +317,13 @@ static bool fp_csp_binder_send(void *p_disp_ctx)
     uint32_t tx_fn;
     uint16_t tx_cmd;
     uint16_t tx_len = p_packet->length;
+    const char *const p_tx_kind = fp_diag_kind(p_packet);
     fp_diag_ids(p_packet, &tx_if, &tx_fn, &tx_cmd);
 
     csp_send(p_csp_params->p_active_conn, p_packet);
 
-    ES_TRACE_INFO("TX resp len=%u iface=%u func=0x%08lx cmd_id=%u -> %u:%u",
-                  (unsigned)tx_len, (unsigned)tx_if, (unsigned long)tx_fn, (unsigned)tx_cmd,
+    ES_TRACE_INFO("TX %s len=%u iface=%u func=0x%08lx cmd_id=%u -> %u:%u",
+                  p_tx_kind, (unsigned)tx_len, (unsigned)tx_if, (unsigned long)tx_fn, (unsigned)tx_cmd,
                   (unsigned)csp_conn_dst(p_csp_params->p_active_conn),
                   (unsigned)csp_conn_dport(p_csp_params->p_active_conn));
 
@@ -300,8 +336,8 @@ static bool fp_csp_binder_send(void *p_disp_ctx)
 
     if ((NULL != p_cli_session) && (FP_REQ_TYPE_SYNC == p_cli_session->req_type))
     {
-        // F2: deadline-bounded loop so stray/injected frames don't kill the session.
-        // F1: drop packets whose CSP source address doesn't match the expected server.
+        // Deadline-bounded loop so stray/injected frames don't kill the session.
+        // Anti-spoofing: drop packets whose CSP source address doesn't match the expected server.
         bool got_response     = false;
         uint32_t deadline_ms  = csp_get_ms() + p_csp_params->timeout;
 
@@ -327,7 +363,7 @@ static bool fp_csp_binder_send(void *p_disp_ctx)
                            (unsigned)p_client_resp_pkt->id.src,
                            csp_conn_sport(p_csp_params->p_active_conn));
 
-            // F1: reject packets whose source node doesn't match the configured server
+            // Anti-spoofing: reject packets whose source node doesn't match the configured server
             if ((int)p_csp_params->dest != (int)p_client_resp_pkt->id.src)
             {
                 ES_TRACE_WARN("<S< src mismatch: expected=%u got=%u — dropping frame",
@@ -337,7 +373,7 @@ static bool fp_csp_binder_send(void *p_disp_ctx)
                 continue;
             }
 
-            // F2: dispatch — break on successful FIDL match
+            // Dispatch, and stop at the first frame that matches a FIDL
             if (csp_fp_dispatch_rcvd_packet(p_client_resp_pkt, p_csp_params))
             {
                 p_client_resp_pkt = NULL; /* ownership transferred; prevent any future UAF */
@@ -358,6 +394,7 @@ static bool fp_csp_binder_send(void *p_disp_ctx)
         }
 
         (void)csp_close(p_csp_params->p_active_conn);
+        p_csp_params->p_active_conn = NULL;
     }
     else
     {

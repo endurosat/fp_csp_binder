@@ -96,6 +96,12 @@ Each case injects one stray CSP frame while a request is waiting:
 - **T2, synchronous stray frame**: a frame with a wrong command ID must not end the wait; the
   request must still complete with `FP_CMD_STATUS_NOERROR`.
 - **T3, asynchronous spoofing**: as T1, on the asynchronous path.
+- **T4, synchronous close**: a synchronous request must close its connection exactly once. The
+  test wraps `csp_connect`, `csp_accept` and `csp_close` (linker `--wrap`) and counts a close of
+  a connection that is not open as a double close.
+- **T5, asynchronous slot reuse** (T5a reply, T5b timeout): the rule an application pool relies on.
+  The callback runs while the connection is still open; afterwards the binder closes it exactly once
+  and only then clears `p_active_conn`, within 500 ms.
 
 ## Dependencies
 
