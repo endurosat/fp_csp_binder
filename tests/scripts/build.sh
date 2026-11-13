@@ -54,7 +54,7 @@ cmake \
 
 # Build
 echo -e "\n${YELLOW}Building...${NC}"
-make -j$(nproc)
+cmake --build . -j"$(nproc 2>/dev/null || echo 4)"
 
 echo -e "\n${GREEN}=== Build complete ===${NC}"
 echo "Build artifacts in: $BUILD_DIR"

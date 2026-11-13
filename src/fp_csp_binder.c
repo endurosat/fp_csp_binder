@@ -83,17 +83,16 @@ bool fp_csp_binder_start(void)
 {
     bool server_thread_res = false;
 
-    TASK_MONITOR_INIT(TASK_ID_UDP);
-    TASK_MONITOR_INIT(TASK_ID_RDP);
-
 #ifdef ENABLE_UDP_THREAD
+    TASK_MONITOR_INIT(TASK_ID_UDP);
     server_thread_res = csp_start_fp_server(&udp_server_cfg);
 #else
     server_thread_res = true;
 #endif
 
 #ifdef ENABLE_RDP_THREAD
-    server_thread_res = server_thread_res && csp_start_fp_server(&rdp_server_cfg) && server_thread_res;
+    TASK_MONITOR_INIT(TASK_ID_RDP);
+    server_thread_res = server_thread_res && csp_start_fp_server(&rdp_server_cfg);
 #endif
 
     return server_thread_res;

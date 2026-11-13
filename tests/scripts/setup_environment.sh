@@ -4,7 +4,7 @@
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-DEPS_DIR="${1:-.}/deps"
+DEPS_DIR="${1:-$SCRIPT_DIR/deps}"
 CSP_ES_VERSION="${CSP_ES_VERSION:-1.4.0}"
 FP_VERSION="${FP_VERSION:-1.4.0}"
 RED='\033[0;31m'
@@ -15,7 +15,7 @@ echo -e "${GREEN}=== FP CSP Binder Test Environment Setup ===${NC}"
 echo "Project root: $PROJECT_ROOT"
 echo "Dependencies directory: $DEPS_DIR"
 echo -e "\n${YELLOW}Checking for required tools...${NC}"
-for tool in cmake git gcc make; do
+for tool in cmake git gcc; do
     if command -v $tool &> /dev/null; then
         echo -e "${GREEN}✓${NC} $tool found"
     else
@@ -23,6 +23,20 @@ for tool in cmake git gcc make; do
         exit 1
     fi
 done
+
+BUILD_TOOL_FOUND=0
+for tool in ninja make mingw32-make; do
+    if command -v $tool &> /dev/null; then
+        echo -e "${GREEN}✓${NC} $tool found"
+        BUILD_TOOL_FOUND=1
+        break
+    fi
+done
+
+if [ $BUILD_TOOL_FOUND -eq 0 ]; then
+    echo -e "${RED}✗${NC} no build tool found (ninja, make, or mingw32-make)"
+    exit 1
+fi
 echo -e "\n${YELLOW}Setting up dependencies...${NC}"
 mkdir -p "$DEPS_DIR"
 if [ ! -d "$DEPS_DIR/csp-es" ]; then
