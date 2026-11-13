@@ -19,19 +19,19 @@ set(FP_PATH "${CMAKE_PREFIX_PATH}/fp")
 # If CMAKE_PREFIX_PATH doesn't work, try relative paths from tests directory
 if(NOT EXISTS "${CSP_ES_PATH}/CMakeLists.txt")
     # Try relative to tests directory
-    set(CSP_ES_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/deps/csp-es")
+    set(CSP_ES_PATH "${CMAKE_CURRENT_SOURCE_DIR}/scripts/deps/csp-es")
     if(NOT EXISTS "${CSP_ES_PATH}/CMakeLists.txt")
         # Try relative to project root
-        set(CSP_ES_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../deps/csp-es")
+        set(CSP_ES_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../deps/csp-es")
     endif()
 endif()
 
 if(NOT EXISTS "${FP_PATH}/CMakeLists.txt")
     # Try relative to tests directory
-    set(FP_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/deps/fp")
+    set(FP_PATH "${CMAKE_CURRENT_SOURCE_DIR}/scripts/deps/fp")
     if(NOT EXISTS "${FP_PATH}/CMakeLists.txt")
         # Try relative to project root
-        set(FP_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../deps/fp")
+        set(FP_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../deps/fp")
     endif()
 endif()
 

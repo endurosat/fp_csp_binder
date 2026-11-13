@@ -15,6 +15,7 @@
 
 # Script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-.}/build"
 DEPS_DIR="${DEPS_DIR:-.}/deps"
 
@@ -39,6 +40,11 @@ if [ "$1" = "--all" ]; then
         echo "Removing dependencies directory: $DEPS_DIR"
         rm -rf "$DEPS_DIR"
         echo -e "${GREEN}✓${NC} Dependencies directory removed"
+    fi
+    if [ -d "$PROJECT_ROOT/tests/config/fp" ]; then
+        echo "Removing generated FP configuration: $PROJECT_ROOT/tests/config/fp"
+        rm -rf "$PROJECT_ROOT/tests/config/fp"
+        echo -e "${GREEN}✓${NC} FP configuration removed"
     fi
 fi
 
