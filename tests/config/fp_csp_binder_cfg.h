@@ -46,10 +46,16 @@
 #define TASK_ID_UDP (0)
 #define TASK_ID_RDP (1)
 
-/** @brief Task monitoring macros — no-op for Linux test environment */
+/** @brief Task monitoring macros. Init and start are no-ops in the Linux test environment.
+ *  The alive indication calls a test hook: fp_csp_binder_os.c holds a weak no-op, and a test
+ *  program that counts the indications defines its own (see projects/fp_adversarial, T6).
+ */
+#include <stdint.h>
+void fp_csp_binder_test_alive_indication(uint16_t task_id);
+
 #define TASK_MONITOR_INIT(task_id)
 #define TASK_MONITOR_START(task_id, p_thread_hnd)
-#define TASK_MONITOR_ALIVE_INDICATION(task_id)
+#define TASK_MONITOR_ALIVE_INDICATION(task_id) fp_csp_binder_test_alive_indication(task_id)
 
 /** @brief Logger initializer — no-op for Linux test environment */
 #define FP_CSP_BINDER_INIT_LOGGER

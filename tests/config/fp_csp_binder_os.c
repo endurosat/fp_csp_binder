@@ -117,6 +117,13 @@ bool fp_csp_binder_os_start_thread(csp_server_cfg_t *const p_server_cfg)
     return true;
 }
 
+/* Default alive-indication hook: no task monitor in the Linux test environment.
+ * Weak, so a test program can define its own to observe the indications. */
+__attribute__((weak)) void fp_csp_binder_test_alive_indication(uint16_t task_id)
+{
+    (void)task_id;
+}
+
 fp_cmd_status_t fp_csp_binder_os_pre_request_hook(uint32_t timeout)
 {
     /* For Linux test environment, no subsystem readiness check needed.

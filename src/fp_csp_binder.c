@@ -261,6 +261,11 @@ void fp_csp_binder_rx_thread_func(void *p_args)
                               (unsigned)rx_if, (unsigned long)rx_fn, (unsigned)rx_cmd);
 
                 csp_fp_dispatch_rcvd_packet(p_rpacket, &p_server_cfg->csp_params);
+
+                // This loop does not end while a packet arrives on the connection in each read timeout. Without
+                // this indication a peer that sends continuously stops the alive reports of a thread that works,
+                // and the task monitor then resets the system
+                TASK_MONITOR_ALIVE_INDICATION(p_server_cfg->task_mon_id);
             }
 
             csp_close(p_server_cfg->csp_params.p_active_conn);

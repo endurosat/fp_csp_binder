@@ -23,9 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Functional test T4: a synchronous request must close its CSP connection exactly once.
 - Functional test T5: an asynchronous request's connection is closed exactly once after the
   callback, and only then is `p_active_conn` cleared (reply and timeout cases).
+- Functional test T6: a server thread reports to the task monitor after each packet of a
+  continuous stream of requests on one connection.
 
 ### Fixed
 
+- The server threads now report to the task monitor after each handled packet. Before, a thread
+  reported only between connections, so a peer that sent a request in each 50 ms read timeout
+  stopped the reports of a thread that worked, and the task monitor of the host project reset the system.
 - The synchronous client path no longer closes its CSP connection twice: it now
   clears the connection pointer after closing, so the session close handler skips it.
 - README: the asynchronous pool example treated a slot as free as soon as the callback

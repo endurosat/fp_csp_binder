@@ -78,7 +78,8 @@ tests/
 - **UDP thread**: enabled on port 12
 - **RDP thread**: enabled on port 13
 - **Buffer size**: `CSP_SERVICE_CFG_BUFFER_SZ` (1024 bytes) from `config/csp_service_cfg.h`
-- **Task monitoring**: disabled (empty macros)
+- **Task monitoring**: no task monitor; the alive indication calls a test hook (a weak no-op in
+  `config/fp_csp_binder_os.c`, which `fp_adversarial` replaces to count the indications)
 
 ## Tests
 
@@ -90,7 +91,7 @@ It passes if every step succeeds. No FP request is sent.
 ### Test 2: Adversarial (`fp_adversarial`)
 
 Runs an FP server and client in one process over the CSP loopback interface (no ZMQ proxy needed).
-Each case injects one stray CSP frame while a request is waiting:
+T1 to T3 inject one stray CSP frame while a request is waiting:
 
 - **T1, synchronous spoofing**: a frame from another node must not be accepted as the response.
 - **T2, synchronous stray frame**: a frame with a wrong command ID must not end the wait; the
@@ -102,6 +103,10 @@ Each case injects one stray CSP frame while a request is waiting:
 - **T5, asynchronous slot reuse** (T5a reply, T5b timeout): the rule an application pool relies on.
   The callback runs while the connection is still open; afterwards the binder closes it exactly once
   and only then clears `p_active_conn`, within 500 ms.
+- **T6, server alive indication**: 200 requests, 10 ms apart, on one connection keep the UDP server
+  thread in its 50 ms read loop for 2 s. The thread must give the task monitor one alive indication
+  per handled packet. The test counts the indications through the hook that
+  `TASK_MONITOR_ALIVE_INDICATION` calls in `config/fp_csp_binder_cfg.h`.
 
 ## Dependencies
 

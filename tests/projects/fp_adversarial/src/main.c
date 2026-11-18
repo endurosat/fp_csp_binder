@@ -11,6 +11,7 @@
  * T4 — sync path closes its connection exactly once
  * T5 — async path: after the callback the binder closes the connection once, then clears
  *      p_active_conn (reply and timeout cases)
+ * T6 — server thread reports alive after each packet of a continuous stream on one connection
  */
 
 #include <stdio.h>
@@ -107,6 +108,7 @@ static fp_csp_binder_params_t g_client_csp_params;
 static pthread_mutex_t   g_conn_track_lock = PTHREAD_MUTEX_INITIALIZER;
 static const csp_conn_t *g_open_conns[CONN_TRACK_MAX];
 static atomic_int        g_double_close_cnt = ATOMIC_VAR_INIT(0);
+static atomic_int        g_accept_cnt       = ATOMIC_VAR_INIT(0); /* connections accepted by the server threads */
 
 csp_conn_t *__real_csp_connect(uint8_t prio, uint16_t dst, uint8_t dst_port, uint32_t timeout, uint32_t opts);
 csp_conn_t *__real_csp_accept(csp_socket_t *socket, uint32_t timeout);
@@ -163,6 +165,7 @@ csp_conn_t *__wrap_csp_accept(csp_socket_t *socket, uint32_t timeout)
 {
     csp_conn_t *conn = __real_csp_accept(socket, timeout);
     conn_track_open(conn);
+    if (NULL != conn) { atomic_fetch_add(&g_accept_cnt, 1); }
     return conn;
 }
 
@@ -225,15 +228,42 @@ static void server_handler(fp_dispatch_info_t *p_disp_ctx)
     }
 }
 
+/* -----------------------------------------------------------------------
+ * T6: alive indications of the server threads, and a request the server
+ * handles at once and does not answer.
+ * fp_csp_binder_cfg.h maps TASK_MONITOR_ALIVE_INDICATION to this hook; it
+ * replaces the weak no-op in fp_csp_binder_os.c.
+ * ----------------------------------------------------------------------- */
+#define T6_FUNC_ID             (0x00000002UL)
+#define T6_TASK_ID_CNT         (2U)    /* TASK_ID_UDP, TASK_ID_RDP */
+
+static atomic_uint g_alive_cnt[T6_TASK_ID_CNT];
+static atomic_uint g_t6_handled_cnt = ATOMIC_VAR_INIT(0);
+
+void fp_csp_binder_test_alive_indication(uint16_t task_id)
+{
+    if (task_id < T6_TASK_ID_CNT)
+    {
+        atomic_fetch_add(&g_alive_cnt[task_id], 1);
+    }
+}
+
+static void t6_stream_handler(fp_dispatch_info_t *p_disp_ctx)
+{
+    (void)p_disp_ctx;
+    atomic_fetch_add(&g_t6_handled_cnt, 1);
+}
+
 static const fidl_func_t g_test_func_list[] = {
-    { .func_id = TEST_FUNC_ID, .p_on_func_cbk = server_handler }
+    { .func_id = TEST_FUNC_ID, .p_on_func_cbk = server_handler },
+    { .func_id = T6_FUNC_ID,   .p_on_func_cbk = t6_stream_handler }
 };
 
 static const fidl_if_t g_test_server_fidl = {
     .version     = 1,
     .gen_type    = FIDL_TYPE_SERVER,
     .fidl_if_id  = TEST_IFACE_ID,
-    .func_count  = 1,
+    .func_count  = 2,
     .p_func_list = g_test_func_list
 };
 
@@ -855,6 +885,96 @@ static int run_async_close_case(const char *name, uint8_t dport, uint32_t timeou
 }
 
 /* -----------------------------------------------------------------------
+ * T6: the server thread must report alive while it serves a continuous stream.
+ * All requests go out on one client connection (one source port), so the server
+ * accepts one connection and every request arrives within the 50 ms timeout of
+ * its csp_read loop: the thread does not return to csp_accept during the stream.
+ * It must give one alive indication per handled packet; with an indication only
+ * before csp_accept the count does not move and the task monitor of the host
+ * project resets the system.
+ * Returns 0 on PASS, non-zero on FAIL.
+ * ----------------------------------------------------------------------- */
+#define T6_STREAM_GAP_MS       (10U)   /* well below the 50 ms read timeout of the server */
+#define T6_STREAM_PKT_CNT      (200U)  /* 200 x 10 ms = 2 s, 40 read timeouts */
+
+static int run_stream_alive_test(const char *name)
+{
+    printf("\n[ADV] === %s ===\n", name);
+
+    csp_conn_t *conn = csp_connect(CSP_PRIO_NORM, TEST_SERVER_NODE, TEST_SERVER_PORT, REQUEST_TIMEOUT_MS, CSP_O_CRC32);
+    if (NULL == conn)
+    {
+        printf("[ADV] %s FAIL: csp_connect failed\n", name);
+        return 1;
+    }
+
+    /* The server thread is idle in csp_accept here: the earlier tests waited for it to close. */
+    atomic_store(&g_t6_handled_cnt, 0);
+    const int      accepts_before = atomic_load(&g_accept_cnt);
+    const unsigned alive_before   = atomic_load(&g_alive_cnt[TASK_ID_UDP]);
+
+    unsigned sent = 0;
+    for (uint32_t i = 0; i < T6_STREAM_PKT_CNT; i++)
+    {
+        csp_packet_t *p_pkt = csp_buffer_get(sizeof(fp_msg_hdr_t));
+        if (NULL != p_pkt)
+        {
+            fp_msg_hdr_t *p_hdr = (fp_msg_hdr_t *)p_pkt->data;
+            memset(p_hdr, 0, sizeof(fp_msg_hdr_t));
+            p_hdr->iface_id = TEST_IFACE_ID;
+            p_hdr->cmd_id   = (uint16_t)i;
+            fp_proto_set_function_type(p_hdr, T6_FUNC_ID, FP_FRAME_TYPE_REQ);
+            p_pkt->length = (uint16_t)sizeof(fp_msg_hdr_t);
+
+            csp_send(conn, p_pkt); /* frees the packet */
+            sent++;
+        }
+        usleep(T6_STREAM_GAP_MS * 1000U);
+    }
+
+    /* Sample while the server is still in its read loop (the last gap is below the read timeout). */
+    const unsigned handled = atomic_load(&g_t6_handled_cnt);
+    const unsigned alive   = atomic_load(&g_alive_cnt[TASK_ID_UDP]) - alive_before;
+    const int      accepts = atomic_load(&g_accept_cnt) - accepts_before;
+
+    csp_close(conn);
+
+    /* Let the server thread time out and close its side before the process ends. */
+    usleep(4U * SERVER_REPLY_HOLD_MS * 1000U);
+
+    printf("[ADV] %s: sent=%u handled=%u alive_indications=%u accepted_connections=%d\n",
+           name, sent, handled, alive, accepts);
+
+    int fail = 0;
+
+    if (1 != accepts)
+    {
+        printf("[ADV] %s FAIL: server accepted %d connection(s) (expected 1: the stream must stay on one)\n",
+               name, accepts);
+        fail = 1;
+    }
+    /* Loopback loses no packet: a few may still be in the queue when the counters are read */
+    if (handled < ((T6_STREAM_PKT_CNT * 9U) / 10U))
+    {
+        printf("[ADV] %s FAIL: server handled %u of %u requests\n", name, handled, sent);
+        fail = 1;
+    }
+    /* One indication per handled packet; the last packet may be between its handler and its indication. */
+    if ((alive + 1U) < handled)
+    {
+        printf("[ADV] %s FAIL: %u alive indication(s) for %u handled packets (thread looks dead to the task monitor)\n",
+               name, alive, handled);
+        fail = 1;
+    }
+    if (0 == fail)
+    {
+        printf("[ADV] %s PASS\n", name);
+    }
+
+    return fail;
+}
+
+/* -----------------------------------------------------------------------
  * CSP router thread: dequeues packets from csp_qfifo and delivers them.
  * Must run for any in-process CSP traffic to work (loopback included).
  * ----------------------------------------------------------------------- */
@@ -979,6 +1099,7 @@ int main(void)
                                      TEST_SERVER_PORT, REQUEST_TIMEOUT_MS, FP_CMD_STATUS_NOERROR);
     failures += run_async_close_case("T5b (async timeout: close once, then clear)",
                                      T5_UNBOUND_PORT, T5_TIMEOUT_MS, FP_CMD_STATUS_TIMEOUT);
+    failures += run_stream_alive_test("T6 (server alive indication during a continuous stream)");
 
     if (failures > 0)
     {

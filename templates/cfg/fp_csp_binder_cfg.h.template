@@ -58,7 +58,8 @@
 /** @brief If task monitoring functionality is available, start function for the task shall be mapped here */
 #define TASK_MONITOR_START(task_id, p_thread_hnd)
 
-/** @brief If task monitoring functionality is available, ALIVE_INDICATION function for the task shall be mapped here */
+/** @brief If task monitoring functionality is available, ALIVE_INDICATION function for the task shall be mapped here.
+ *  A server thread calls it before each wait for a connection and after each handled packet: keep it short. */
 #define TASK_MONITOR_ALIVE_INDICATION(task_id)
 
 /** @brief Logger initializer. Replace with the appropriate logger init for your project. */
