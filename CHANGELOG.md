@@ -7,23 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-11-20
+
 ### Added
 
-- First public release, source-available under the EnduroSat Software License v1.0.
-  Earlier versions were released internally only.
-- FP request/response handling over CSP, with UDP and RDP server threads and
-  synchronous and asynchronous client paths.
-- Platform-neutral templates for the OS port (CMSIS-RTOS2, FreeRTOS) and for the
-  configuration headers the host project provides.
 - Asynchronous pools free a slot in fp's release handler (`fp_dispatch_info_t::p_on_released`),
   which runs after the connection is closed; the README example shows the pattern. Freeing a slot
   in the response handler is no longer correct: the binder can still be using the slot's
   connection parameters at that point.
-- Client-path hardening: responses are accepted only from the addressed node,
-  and the synchronous wait is bounded by the request timeout.
-- Functional tests on Linux: an initialisation test, and adversarial tests over
-  the CSP loopback interface that inject spoofed and stray frames. The tests fetch
-  `csp-es` and `fp` from their public GitHub repositories at pinned versions.
 - Functional test T4: a synchronous request must close its CSP connection exactly once.
 - Functional test T5: an asynchronous request's connection is closed exactly once after the
   callback, and only then is `p_active_conn` cleared (reply and timeout cases).
@@ -75,3 +66,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The request/response trace labelled every transmitted frame as a response, including
   this node's own requests. Each RX and TX line now shows `req`, `resp` or `bcast`, read
   from the frame's FP header.
+
+## [1.1.0] - 2026-10-21
+
+### Added
+
+- First public release, source-available under the EnduroSat Software License v1.0.
+  Earlier versions were released internally only.
+- FP request/response handling over CSP, with UDP and RDP server threads and
+  synchronous and asynchronous client paths.
+- Platform-neutral templates for the OS port (CMSIS-RTOS2, FreeRTOS) and for the
+  configuration headers the host project provides.
+- Client-path hardening: responses are accepted only from the addressed node,
+  and the synchronous wait is bounded by the request timeout.
+- Functional tests on Linux: an initialisation test, and adversarial tests over
+  the CSP loopback interface that inject spoofed and stray frames. The tests fetch
+  `csp-es` and `fp` from their public GitHub repositories at pinned versions.
