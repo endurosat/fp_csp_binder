@@ -13,13 +13,14 @@
 /** @brief Structure specifying the necessary parameters for a CSP send operation */
 typedef struct
 {
-    uint8_t     prio;          /**< CSP message priority, see @ref csp_prio_t */
-    uint16_t    dest;          /**< destination node address */
-    uint8_t     dport;         /**< destination node port */
-    uint32_t    timeout;       /**< milliseconds to wait for the response */
-    uint32_t    opts;          /**< connection options, see @ref CSP_CONNECTION_OPTIONS defines for possible values */
-    csp_conn_t *p_active_conn; /**< this field is not provided by the user but reserved for fp_csp_binder internal use */
-    void       *p_user_args;   /**< user-specific data communicated through the comm params structure */
+    uint8_t       prio;          /**< CSP message priority, see @ref csp_prio_t */
+    uint16_t      dest;          /**< destination node address */
+    uint8_t       dport;         /**< destination node port */
+    uint32_t      timeout;       /**< milliseconds to wait for the response */
+    uint32_t      opts;          /**< connection options, see @ref CSP_CONNECTION_OPTIONS defines for possible values */
+    csp_conn_t   *p_active_conn; /**< this field is not provided by the user but reserved for fp_csp_binder internal use */
+    void         *p_user_args;   /**< user-specific data communicated through the comm params structure */
+    csp_packet_t *p_pending_pkt; /**< reserved for fp_csp_binder internal use: an async response read under the session lock and dispatched after it */
 } fp_csp_binder_params_t;
 
 /** @brief Structure specifying CSP-specific functions to configure in regard to the FP service system context */

@@ -12,6 +12,15 @@
  * T5 — async path: after the callback the binder closes the connection once, then clears
  *      p_active_conn (reply and timeout cases)
  * T6 — server thread reports alive after each packet of a continuous stream on one connection
+ * T7 — async path: the response handler and the release handler run without the client-session
+ *      lock (another thread can take it meanwhile), and the release handler runs once, after the
+ *      connection is closed (reply and timeout cases)
+ * T8 — async path: a stray frame from the addressed node with a wrong command ID is dropped and
+ *      freed, the request stays open, and the real reply is then delivered once
+ * T9 — sync path with params set field by field (p_pending_pkt left stale): the session close
+ *      does not free what the stale field points to
+ * T10 — a session closed while a response is still parked frees that response once and closes
+ *      its connection once
  */
 
 #include <stdio.h>
@@ -47,6 +56,7 @@
 #define TEST_ATTACKER_NODE     (7U)
 #define TEST_SERVER_PORT       (CSP_FP_UDP_SERVER_PORT)
 #define SERVER_REPLY_HOLD_MS   (50U)
+#define TRACKER_PERIOD_MS      (5U)    /* period of the session tracker thread */
 #define REQUEST_TIMEOUT_MS     (2000U)
 
 #define TEST_IFACE_ID          (0x0042U)
@@ -336,6 +346,7 @@ static fp_cmd_status_t test_send_req_async(fp_dispatch_info_t            *p_disp
  *
  * mode 0 = T1: correct (iface_id, func_id, cmd_id), wrong payload, src=ATTACKER
  * mode 1 = T2: wrong cmd_id (0xDEAD), src=ATTACKER
+ * mode 2 = T8: wrong cmd_id (0xDEAD), src=SERVER (passes the source check)
  * ----------------------------------------------------------------------- */
 typedef struct {
     pthread_barrier_t *p_barrier;
@@ -392,7 +403,7 @@ static void *attacker_thread(void *arg)
     }
     else
     {
-        /* T2: mismatched cmd_id — stray frame before legitimate reply */
+        /* T2, T8: mismatched cmd_id — stray frame before legitimate reply */
         p_hdr->cmd_id = 0xDEADU;
         memset(adv_buf + sizeof(fp_msg_hdr_t), 0x00U, KNOWN_PAYLOAD_SIZE);
     }
@@ -411,9 +422,12 @@ static void *attacker_thread(void *arg)
     p_pkt->length = (uint16_t)sizeof(adv_buf);
 
     /* CSP header: inject to the client's connection (dport = client's sport).
-     * id.src = ATTACKER — this is the node the client should reject (F1 fix). */
+     * id.src = ATTACKER — this is the node the client should reject (F1 fix).
+     * Mode 2 uses the addressed node, so the frame reaches the dispatch step. */
+    const uint16_t src_node = (a->mode == 2) ? TEST_SERVER_NODE : TEST_ATTACKER_NODE;
+
     p_pkt->id.pri   = CSP_PRIO_NORM;
-    p_pkt->id.src   = TEST_ATTACKER_NODE;
+    p_pkt->id.src   = src_node;
     p_pkt->id.dst   = TEST_CLIENT_NODE;
     p_pkt->id.dport = client_sport;
     p_pkt->id.sport = TEST_SERVER_PORT;
@@ -428,7 +442,7 @@ static void *attacker_thread(void *arg)
     csp_qfifo_write(p_pkt, &csp_if_lo, NULL);
 
     printf("[ATTACKER] mode=%d frame injected (cmd_id=0x%04X src=%u sport=%u)\n",
-           a->mode, p_hdr->cmd_id, TEST_ATTACKER_NODE, (unsigned)client_sport);
+           a->mode, p_hdr->cmd_id, (unsigned)src_node, (unsigned)client_sport);
     return NULL;
 }
 
@@ -738,6 +752,159 @@ static int run_sync_close_test(const char *name)
 }
 
 /* -----------------------------------------------------------------------
+ * T9: a caller that passes its params to fp directly must not have a stale
+ * p_pending_pkt freed.
+ * Callers such as a gateway build fp_csp_binder_params_t field by field on the
+ * stack and call fp_disp_client_send_req themselves, without
+ * fp_csp_binder_req_sync, so p_pending_pkt holds whatever the stack held. Here it
+ * points to a real CSP buffer the test still owns. The binder must clear the field
+ * itself: the session close must not free that buffer.
+ * Returns 0 on PASS, non-zero on FAIL.
+ * ----------------------------------------------------------------------- */
+static int run_sync_unset_pending_test(const char *name)
+{
+    printf("\n[ADV] === %s ===\n", name);
+
+    csp_packet_t *p_held = csp_buffer_get(0);
+
+    if (NULL == p_held)
+    {
+        printf("[ADV] %s FAIL: no CSP buffer for the stale pointer\n", name);
+        return 1;
+    }
+
+    fp_dispatch_info_t     disp_ctx = { 0 };
+    fp_csp_binder_params_t params;
+
+    /* only the fields such a caller sets; p_pending_pkt is left stale */
+    params.prio          = CSP_PRIO_NORM;
+    params.dest          = TEST_SERVER_NODE;
+    params.dport         = TEST_SERVER_PORT;
+    params.timeout       = REQUEST_TIMEOUT_MS;
+    params.opts          = CSP_O_CRC32;
+    params.p_active_conn = NULL;
+    params.p_user_args   = NULL;
+    params.p_pending_pkt = p_held;
+
+    fp_config_user_assign_sys_context(&disp_ctx, FP_CONFIG_SYS_CTX_TYPE_CSP);
+    disp_ctx.p_comm_params = &params;
+
+    uint8_t req_buf[sizeof(fp_msg_hdr_t)] = { 0 };
+    uint8_t resp_buf[TEST_RESP_SIZE]      = { 0 };
+
+    const int remaining_before = csp_buffer_remaining();
+
+    fp_cmd_status_t res = test_send_req(&disp_ctx, FP_FRAME_TYPE_REQ, req_buf, resp_buf, REQUEST_TIMEOUT_MS);
+
+    /* Let the server thread release its buffers too. */
+    usleep(4U * SERVER_REPLY_HOLD_MS * 1000U);
+
+    const int remaining_after = csp_buffer_remaining();
+    int       fail            = 0;
+
+    if (FP_CMD_STATUS_NOERROR != res)
+    {
+        printf("[ADV] %s FAIL: status=0x%02X (expected NOERROR)\n", name, (unsigned)res);
+        fail = 1;
+    }
+    if (remaining_after != remaining_before)
+    {
+        /* one more free buffer than before: the session close freed the buffer the test holds */
+        printf("[ADV] %s FAIL: free CSP buffers %d before, %d after (the held buffer was freed)\n",
+               name, remaining_before, remaining_after);
+        fail = 1;
+    }
+    if (0 == fail)
+    {
+        printf("[ADV] %s PASS\n", name);
+    }
+
+    csp_buffer_free(p_held);
+
+    return fail;
+}
+
+/* -----------------------------------------------------------------------
+ * T10: a session closed while a response is still parked frees that response.
+ * fp's session tracker calls the deliver handler, which clears p_pending_pkt,
+ * before any close, so this test drives the session manager directly: it opens
+ * a client session (the open handler connects and clears p_pending_pkt), parks
+ * a real CSP buffer as the binder would, and closes the session. The session
+ * stays OPENED, so the tracker never touches it.
+ * The close must free the parked buffer once and close the connection once.
+ * Returns 0 on PASS, non-zero on FAIL.
+ * ----------------------------------------------------------------------- */
+static int run_close_parked_test(const char *name)
+{
+    printf("\n[ADV] === %s ===\n", name);
+
+    atomic_store(&g_double_close_cnt, 0);
+
+    fp_csp_binder_params_t params = { 0 };
+    params.prio    = CSP_PRIO_NORM;
+    params.dest    = TEST_SERVER_NODE;
+    params.dport   = TEST_SERVER_PORT;
+    params.timeout = REQUEST_TIMEOUT_MS;
+    params.opts    = CSP_O_CRC32;
+
+    fp_dispatch_sys_context_t *const p_sys_ctx = g_server_disp_ctx.p_sys_ctx;
+
+    const int remaining_before = csp_buffer_remaining();
+
+    fp_disp_session_base_t *const p_sess =
+        fp_disp_session_mgr_open_session(p_sys_ctx, &params, FP_DISP_SESSION_TYPE_CLIENT);
+
+    if ((NULL == p_sess) || (NULL == params.p_active_conn))
+    {
+        printf("[ADV] %s FAIL: the client session did not open with a connection\n", name);
+        if (NULL != p_sess) { fp_disp_session_mgr_close_session(p_sys_ctx, p_sess); }
+        return 1;
+    }
+
+    csp_packet_t *const p_parked = csp_buffer_get(0);
+
+    if (NULL == p_parked)
+    {
+        printf("[ADV] %s FAIL: no CSP buffer to park\n", name);
+        fp_disp_session_mgr_close_session(p_sys_ctx, p_sess);
+        return 1;
+    }
+
+    params.p_pending_pkt = p_parked;
+
+    fp_disp_session_mgr_close_session(p_sys_ctx, p_sess);
+
+    const int remaining_after = csp_buffer_remaining();
+    const int double_closes   = atomic_load(&g_double_close_cnt);
+    int       fail            = 0;
+
+    if (remaining_after != remaining_before)
+    {
+        /* one buffer fewer than before: the close did not free the parked response */
+        printf("[ADV] %s FAIL: free CSP buffers %d before, %d after (the parked buffer leaked)\n",
+               name, remaining_before, remaining_after);
+        fail = 1;
+    }
+    if ((NULL != params.p_pending_pkt) || (NULL != params.p_active_conn))
+    {
+        printf("[ADV] %s FAIL: the close left p_pending_pkt=%p p_active_conn=%p\n",
+               name, (void *)params.p_pending_pkt, (void *)params.p_active_conn);
+        fail = 1;
+    }
+    if (0 != double_closes)
+    {
+        printf("[ADV] %s FAIL: %d double close(s)\n", name, double_closes);
+        fail = 1;
+    }
+    if (0 == fail)
+    {
+        printf("[ADV] %s PASS\n", name);
+    }
+
+    return fail;
+}
+
+/* -----------------------------------------------------------------------
  * T5: the async slot-reuse contract an application pool relies on.
  * The callback runs while the connection is still open; afterwards the binder
  * closes it exactly once and only then clears p_active_conn. A pool that
@@ -973,6 +1140,371 @@ static int run_stream_alive_test(const char *name)
 
     return fail;
 }
+/* -----------------------------------------------------------------------
+ * T7: no application callback runs under the client-session lock.
+ * Inside each callback a probe thread looks up a client session, which takes
+ * that lock. If the callback ran under the lock, the probe would wait until the
+ * callback returned, so the callback would see it time out.
+ * ----------------------------------------------------------------------- */
+#define T7_PROBE_WAIT_MS       (500U)
+#define T7_PROBE_SLOTS         (8U)
+/* After the first release, how long to watch for a second one. A second release would come from
+ * another tracker pass; 100 periods leaves room for a loaded host. */
+#define T7_ONCE_WAIT_MS        (100U * TRACKER_PERIOD_MS)
+
+typedef struct {
+    sem_t done;
+} t7_probe_t;
+
+/* never destroyed: a probe that timed out finishes later and still posts its semaphore */
+static t7_probe_t  g_t7_probes[T7_PROBE_SLOTS];
+static atomic_uint g_t7_probe_next = ATOMIC_VAR_INIT(0U);
+
+static void *t7_probe_thread(void *arg)
+{
+    t7_probe_t  *p_probe = (t7_probe_t *)arg;
+    fp_msg_hdr_t hdr;
+
+    memset(&hdr, 0xFF, sizeof(hdr)); /* matches no session; the lookup only needs the lock */
+    (void)fp_disp_session_mgr_find_session(g_server_disp_ctx.p_sys_ctx, FP_DISP_SESSION_TYPE_CLIENT, &hdr);
+    sem_post(&p_probe->done);
+    return NULL;
+}
+
+typedef enum {
+    T7_PROBE_NOT_RUN = 0, /* the callback did not run (yet) */
+    T7_LOCK_FREE,         /* another thread took the client-session lock while the caller waited */
+    T7_LOCK_HELD,         /* the probe timed out: the caller held the lock */
+    T7_PROBE_ERROR        /* the probe could not start: no free slot, or pthread_create failed */
+} t7_probe_res_t;
+
+static t7_probe_res_t t7_probe_lock(void)
+{
+    const unsigned slot = atomic_fetch_add(&g_t7_probe_next, 1U);
+    if (slot >= T7_PROBE_SLOTS) { return T7_PROBE_ERROR; }
+
+    t7_probe_t *p_probe = &g_t7_probes[slot];
+    sem_init(&p_probe->done, 0, 0);
+
+    pthread_t      handle;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    const int rc = pthread_create(&handle, &attr, t7_probe_thread, p_probe);
+    pthread_attr_destroy(&attr);
+    if (0 != rc) { return T7_PROBE_ERROR; }
+
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_nsec += (long)T7_PROBE_WAIT_MS * 1000000L;
+    while (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+
+    return (0 == sem_timedwait(&p_probe->done, &deadline)) ? T7_LOCK_FREE : T7_LOCK_HELD;
+}
+
+typedef struct {
+    sem_t                   released;
+    fp_cmd_status_t         status;
+    int                     resp_cnt;
+    int                     release_cnt;
+    t7_probe_res_t          resp_lock;
+    t7_probe_res_t          release_lock;
+    bool                    conn_closed_at_release; /* p_active_conn was NULL in the release handler */
+    void                   *p_released_params;
+} t7_result_t;
+
+/* set and cleared by the test thread, read by the callbacks on the binder's threads */
+static t7_result_t *_Atomic g_t7_result = NULL;
+
+static void t7_resp_handler(void                 *p_disp_ctx,
+                            uint8_t              *p_untyped_resp,
+                            const fp_cmd_status_t cmd_status)
+{
+    (void)p_disp_ctx;
+    (void)p_untyped_resp;
+    t7_result_t *const p_result = atomic_load(&g_t7_result);
+    if (NULL == p_result) { return; }
+
+    p_result->status    = cmd_status;
+    p_result->resp_lock = t7_probe_lock();
+    p_result->resp_cnt++;
+}
+
+static void t7_released_handler(void *p_comm_params)
+{
+    t7_result_t *const p_result = atomic_load(&g_t7_result);
+    if (NULL == p_result) { return; }
+
+    const fp_csp_binder_params_t *p_params = (const fp_csp_binder_params_t *)p_comm_params;
+
+    p_result->p_released_params      = p_comm_params;
+    p_result->conn_closed_at_release = (NULL != p_params) && (NULL == p_params->p_active_conn);
+    p_result->release_lock           = t7_probe_lock();
+    p_result->release_cnt++;
+    sem_post(&p_result->released);
+}
+
+/* One async request with a release handler. Returns 0 on PASS, non-zero on FAIL. */
+static int run_async_lock_case(const char *name, uint8_t dport, uint32_t timeout_ms,
+                               fp_cmd_status_t expect_status)
+{
+    printf("\n[ADV] === %s ===\n", name);
+
+    t7_result_t result;
+    memset(&result, 0, sizeof(result));
+    result.status = FP_CMD_STATUS_MAX;
+    sem_init(&result.released, 0, 0);
+    atomic_store(&g_t7_result, &result);
+
+    /* Static: the binder keeps using these after fp_csp_binder_req_async returns. */
+    static fp_dispatch_info_t     disp_ctx;
+    static fp_csp_binder_params_t params;
+    static uint8_t                req_buf[sizeof(fp_msg_hdr_t)];
+
+    memset(&disp_ctx, 0, sizeof(disp_ctx));
+    memset(&params, 0, sizeof(params));
+    memset(req_buf, 0, sizeof(req_buf));
+    params.prio    = CSP_PRIO_NORM;
+    params.dest    = TEST_SERVER_NODE;
+    params.dport   = dport;
+    params.timeout = timeout_ms;
+    params.opts    = CSP_O_CRC32;
+
+    fp_config_user_assign_sys_context(&disp_ctx, FP_CONFIG_SYS_CTX_TYPE_CSP);
+    disp_ctx.p_on_released = t7_released_handler;
+
+    fp_cmd_status_t launch = fp_csp_binder_req_async(FP_FRAME_TYPE_REQ, &params, test_send_req_async,
+                                                     &disp_ctx, req_buf, t7_resp_handler, timeout_ms);
+
+    int fail = 0;
+
+    if (FP_CMD_STATUS_NOERROR != launch)
+    {
+        printf("[ADV] %s FAIL: launch status=0x%02X\n", name, (unsigned)launch);
+        fail = 1;
+    }
+    else
+    {
+        const uint32_t wait_ms = timeout_ms + 2U * T7_PROBE_WAIT_MS + 1000U;
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec  += wait_ms / 1000U;
+        deadline.tv_nsec += (long)((wait_ms % 1000U) * 1000000L);
+        if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+
+        if (0 != sem_timedwait(&result.released, &deadline))
+        {
+            printf("[ADV] %s FAIL: release handler never called\n", name);
+            fail = 1;
+        }
+        else
+        {
+            /* watch for a second release (see T7_ONCE_WAIT_MS) */
+            usleep(T7_ONCE_WAIT_MS * 1000U);
+
+            if (expect_status != result.status)
+            {
+                printf("[ADV] %s FAIL: callback status=0x%02X (expected 0x%02X)\n",
+                       name, (unsigned)result.status, (unsigned)expect_status);
+                fail = 1;
+            }
+            if ((1 != result.resp_cnt) || (1 != result.release_cnt))
+            {
+                printf("[ADV] %s FAIL: response handler ran %d time(s), release handler %d time(s) (expected 1 each)\n",
+                       name, result.resp_cnt, result.release_cnt);
+                fail = 1;
+            }
+            if ((T7_PROBE_ERROR == result.resp_lock) || (T7_PROBE_ERROR == result.release_lock))
+            {
+                printf("[ADV] %s ERROR: a lock probe could not start (no free probe slot, or pthread_create failed)\n", name);
+                fail = 1;
+            }
+            if (T7_LOCK_HELD == result.resp_lock)
+            {
+                printf("[ADV] %s FAIL: the response handler ran under the client-session lock\n", name);
+                fail = 1;
+            }
+            if (T7_LOCK_HELD == result.release_lock)
+            {
+                printf("[ADV] %s FAIL: the release handler ran under the client-session lock\n", name);
+                fail = 1;
+            }
+            if ((void *)&params != result.p_released_params)
+            {
+                printf("[ADV] %s FAIL: the release handler got other comm params\n", name);
+                fail = 1;
+            }
+            if (!result.conn_closed_at_release)
+            {
+                printf("[ADV] %s FAIL: the connection was still open in the release handler\n", name);
+                fail = 1;
+            }
+        }
+    }
+
+    atomic_store(&g_t7_result, NULL);
+    sem_destroy(&result.released);
+
+    if (0 == fail)
+    {
+        printf("[ADV] %s PASS\n", name);
+    }
+
+    return fail;
+}
+
+/* -----------------------------------------------------------------------
+ * T8: a stray frame from the addressed node, with a wrong command ID, arrives
+ * while an asynchronous request waits. It passes the source check, so the binder
+ * parks it; its dispatch fails, so the binder frees it and keeps the session
+ * open. The real reply must then reach the response handler exactly once, and
+ * no CSP buffer may be lost.
+ * ----------------------------------------------------------------------- */
+typedef struct {
+    sem_t           done;
+    fp_cmd_status_t status;
+    atomic_int      resp_cnt;
+    uint8_t         payload[KNOWN_PAYLOAD_SIZE];
+} t8_result_t;
+
+static t8_result_t *_Atomic g_t8_result = NULL;
+
+static void t8_resp_handler(void                 *p_disp_ctx,
+                            uint8_t              *p_untyped_resp,
+                            const fp_cmd_status_t cmd_status)
+{
+    (void)p_disp_ctx;
+    t8_result_t *const p_res = atomic_load(&g_t8_result);
+    if (NULL == p_res) { return; }
+
+    p_res->status = cmd_status;
+    if (NULL != p_untyped_resp)
+    {
+        memcpy(p_res->payload, p_untyped_resp + sizeof(fp_msg_hdr_t), KNOWN_PAYLOAD_SIZE);
+    }
+    atomic_fetch_add(&p_res->resp_cnt, 1);
+    sem_post(&p_res->done);
+}
+
+/* Returns 0 on PASS, non-zero on FAIL. */
+static int run_async_stray_test(const char *name)
+{
+    printf("\n[ADV] === %s ===\n", name);
+
+    atomic_store(&g_client_cmd_id, UINT16_MAX);
+    atomic_store(&g_server_handler_fired, 0);
+
+    t8_result_t result;
+    memset(&result, 0, sizeof(result));
+    result.status = FP_CMD_STATUS_MAX;
+    sem_init(&result.done, 0, 0);
+    atomic_store(&g_t8_result, &result);
+
+    const int free_bufs_before = csp_buffer_remaining();
+
+    /* Static: the binder keeps using it after fp_csp_binder_req_async returns. */
+    static fp_dispatch_info_t disp_ctx;
+    static uint8_t            req_buf[sizeof(fp_msg_hdr_t)];
+
+    memset(&disp_ctx, 0, sizeof(disp_ctx));
+    memset(req_buf, 0, sizeof(req_buf));
+    memset(&g_client_csp_params, 0, sizeof(g_client_csp_params)); /* the attacker reads its connection */
+    g_client_csp_params.prio    = CSP_PRIO_NORM;
+    g_client_csp_params.dest    = TEST_SERVER_NODE;
+    g_client_csp_params.dport   = TEST_SERVER_PORT;
+    g_client_csp_params.timeout = REQUEST_TIMEOUT_MS;
+    g_client_csp_params.opts    = CSP_O_CRC32;
+
+    fp_config_user_assign_sys_context(&disp_ctx, FP_CONFIG_SYS_CTX_TYPE_CSP);
+
+    pthread_barrier_t barrier;
+    pthread_barrier_init(&barrier, NULL, 2); /* this thread + attacker */
+
+    attacker_args_t att_args = { .p_barrier = &barrier, .mode = 2 };
+    pthread_t       att_tid;
+    int             fail = 0;
+
+    if (0 != pthread_create(&att_tid, NULL, attacker_thread, &att_args))
+    {
+        printf("[ADV] %s ERROR: could not create the attacker thread\n", name);
+        pthread_barrier_destroy(&barrier);
+        atomic_store(&g_t8_result, NULL);
+        sem_destroy(&result.done);
+        return 1;
+    }
+
+    pthread_barrier_wait(&barrier);
+
+    fp_cmd_status_t launch = fp_csp_binder_req_async(FP_FRAME_TYPE_REQ, &g_client_csp_params,
+                                                     test_send_req_async, &disp_ctx, req_buf,
+                                                     t8_resp_handler, REQUEST_TIMEOUT_MS);
+    pthread_join(att_tid, NULL);
+    pthread_barrier_destroy(&barrier);
+
+    if (FP_CMD_STATUS_NOERROR != launch)
+    {
+        printf("[ADV] %s FAIL: launch status=0x%02X\n", name, (unsigned)launch);
+        fail = 1;
+    }
+    else
+    {
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec  += (REQUEST_TIMEOUT_MS + 500U) / 1000U;
+        deadline.tv_nsec += (long)(((REQUEST_TIMEOUT_MS + 500U) % 1000U) * 1000000L);
+        if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+
+        if (0 != sem_timedwait(&result.done, &deadline))
+        {
+            printf("[ADV] %s FAIL: response handler never called\n", name);
+            fail = 1;
+        }
+        else
+        {
+            /* a second call, and the server's and binder's buffer frees, come within a few tracker periods */
+            usleep(4U * SERVER_REPLY_HOLD_MS * 1000U);
+
+            const int resp_cnt = atomic_load(&result.resp_cnt);
+            if (1 != resp_cnt)
+            {
+                printf("[ADV] %s FAIL: response handler ran %d time(s) (expected 1)\n", name, resp_cnt);
+                fail = 1;
+            }
+            if (FP_CMD_STATUS_NOERROR != result.status)
+            {
+                printf("[ADV] %s FAIL: handler status=0x%02X (expected NOERROR)\n",
+                       name, (unsigned)result.status);
+                fail = 1;
+            }
+            for (uint32_t i = 0; (0 == fail) && (i < KNOWN_PAYLOAD_SIZE); i++)
+            {
+                if (KNOWN_PAYLOAD_BYTE != result.payload[i])
+                {
+                    printf("[ADV] %s FAIL: the handler got the stray frame's payload\n", name);
+                    fail = 1;
+                }
+            }
+        }
+    }
+
+    const int free_bufs_after = csp_buffer_remaining();
+    if (free_bufs_after != free_bufs_before)
+    {
+        printf("[ADV] %s FAIL: %d free CSP buffer(s) before, %d after\n",
+               name, free_bufs_before, free_bufs_after);
+        fail = 1;
+    }
+
+    atomic_store(&g_t8_result, NULL);
+    sem_destroy(&result.done);
+
+    if (0 == fail)
+    {
+        printf("[ADV] %s PASS\n", name);
+    }
+
+    return fail;
+}
 
 /* -----------------------------------------------------------------------
  * CSP router thread: dequeues packets from csp_qfifo and delivers them.
@@ -1004,7 +1536,7 @@ static void router_start(void)
 static void *task_session_tracker(void *param)
 {
     fp_dispatch_sys_context_t *p_sys_ctx = (fp_dispatch_sys_context_t *)param;
-    struct timespec sleep_ts = { .tv_sec = 0, .tv_nsec = 5 * 1000000L }; /* 5 ms */
+    struct timespec sleep_ts = { .tv_sec = 0, .tv_nsec = (long)TRACKER_PERIOD_MS * 1000000L };
     while (1)
     {
         fp_disp_session_mgr_track_sessions(p_sys_ctx);
@@ -1100,6 +1632,13 @@ int main(void)
     failures += run_async_close_case("T5b (async timeout: close once, then clear)",
                                      T5_UNBOUND_PORT, T5_TIMEOUT_MS, FP_CMD_STATUS_TIMEOUT);
     failures += run_stream_alive_test("T6 (server alive indication during a continuous stream)");
+    failures += run_async_lock_case("T7a (async reply: handlers run without the lock)",
+                                    TEST_SERVER_PORT, REQUEST_TIMEOUT_MS, FP_CMD_STATUS_NOERROR);
+    failures += run_async_lock_case("T7b (async timeout: handlers run without the lock)",
+                                    T5_UNBOUND_PORT, T5_TIMEOUT_MS, FP_CMD_STATUS_TIMEOUT);
+    failures += run_async_stray_test("T8 (async stray frame from the addressed node: kept, freed, reply delivered once)");
+    failures += run_sync_unset_pending_test("T9 (sync request with params set field by field: stale pending packet not freed)");
+    failures += run_close_parked_test("T10 (session closed with a response still parked: response freed once)");
 
     if (failures > 0)
     {

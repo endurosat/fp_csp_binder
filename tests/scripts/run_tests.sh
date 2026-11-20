@@ -73,7 +73,7 @@ fi
 # Test 2: Adversarial (client-path hardening)
 ##############################################################################
 
-echo -e "\n${YELLOW}=== Test 2: Adversarial (T1 sync spoof / F1, T2 sync DoS / F2, T3 async spoof / F1, T4 sync close, T5 async slot reuse, T6 server alive indication) ===${NC}"
+echo -e "\n${YELLOW}=== Test 2: Adversarial (T1 sync spoof / F1, T2 sync DoS / F2, T3 async spoof / F1, T4 sync close, T5 async close, T6 server alive indication, T7 async callbacks outside the lock, T8 async stray frame, T9 stale pending packet, T10 close with a parked response) ===${NC}"
 if "$BUILD_DIR/projects/fp_adversarial/fp_adversarial"; then
     echo -e "${GREEN}✓ Adversarial test PASSED${NC}"
     ADVERSARIAL_TEST_PASSED=1

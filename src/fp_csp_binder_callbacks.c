@@ -28,13 +28,23 @@ FP_CSP_BINDER_INIT_LOGGER
  */
 static bool fp_csp_binder_session_open_handler(fp_disp_session_base_t *const p_sess);
 
-/** @brief Called during session tracking to check if session should be closed
+/** @brief Called during session tracking, under the client-session lock: polls an asynchronous
+ *  session's connection and parks a received response for fp_csp_binder_session_deliver_handler
  *
  *  @param[in] p_sess Pointer to the session data to perform tracking on
  *
- *  @return session user track action
+ *  @return FP_DISP_TRACK_ACTION_DELIVER when a response is parked, otherwise KEEP_SESSION_ACTIVE
  */
 static fp_session_track_action_t fp_csp_binder_session_track_handler(fp_disp_session_base_t *const p_sess);
+
+/** @brief Called by the session tracker without any fp lock held: dispatches the parked response,
+ *  which runs the application's response handler
+ *
+ *  @param[in] p_sess Pointer to the client session the response was parked for
+ *
+ *  @return CLOSE_SESSION when the response was delivered, otherwise KEEP_SESSION_ACTIVE
+ */
+static fp_session_track_action_t fp_csp_binder_session_deliver_handler(fp_disp_session_base_t *const p_sess);
 
 /** @brief Called before a session is closed to enable users to free resources
  *
@@ -50,9 +60,10 @@ static void fp_csp_binder_session_close_handler(fp_disp_session_base_t *const p_
 
 /** @brief Structure containing all CSP binder session lifecycle callbacks */
 static const fp_user_session_callbacks_t fp_csp_binder_callbacks = {
-    .p_open  = fp_csp_binder_session_open_handler,
-    .p_track = fp_csp_binder_session_track_handler,
-    .p_close = fp_csp_binder_session_close_handler
+    .p_open    = fp_csp_binder_session_open_handler,
+    .p_track   = fp_csp_binder_session_track_handler,
+    .p_close   = fp_csp_binder_session_close_handler,
+    .p_deliver = fp_csp_binder_session_deliver_handler
 };
 
 /*
@@ -83,6 +94,11 @@ static bool fp_csp_binder_session_open_handler(fp_disp_session_base_t *const p_s
     BREAK_ASSERT(NULL != p_sess);
 
     fp_csp_binder_params_t *p_csp_params = (fp_csp_binder_params_t *)p_sess->p_comm_params;
+
+    // The binder owns this field. A caller that passes its params to fp directly, not through
+    // fp_csp_binder_req_sync/async, leaves it unset, and the close handler frees what it holds.
+    // Clear it first: a failed open is followed by a close.
+    p_csp_params->p_pending_pkt = NULL;
 
     if (NULL == p_csp_params->p_active_conn)
     {
@@ -130,6 +146,15 @@ static fp_session_track_action_t fp_csp_binder_session_track_handler(fp_disp_ses
         return FP_DISP_TRACK_ACTION_KEEP_SESSION_ACTIVE;
     }
 
+    // a parked response still waiting for its delivery (not expected: the session tracker does not
+    // track a session again before it has called the deliver handler for it)
+    if (NULL != p_csp_params->p_pending_pkt)
+    {
+        BREAK_ASSERT(NULL == p_csp_params->p_pending_pkt);
+
+        return FP_DISP_TRACK_ACTION_DELIVER;
+    }
+
     // Poll the connection with timeout 0 to see if there is any data pending
     csp_packet_t *p_client_resp_pkt = csp_read(p_csp_params->p_active_conn, 0);
 
@@ -149,36 +174,52 @@ static fp_session_track_action_t fp_csp_binder_session_track_handler(fp_disp_ses
             return FP_DISP_TRACK_ACTION_KEEP_SESSION_ACTIVE;
         }
 
-        // Create dispatch context for the received packet
-        fp_dispatch_info_t disp_ctx = { 0 };
-        disp_ctx.data_size     = p_client_resp_pkt->length;
-        disp_ctx.p_data        = p_client_resp_pkt->data;
-        disp_ctx.p_comm_params = (void *)p_csp_params;
+        // this runs under the client-session lock: park the packet; the session tracker calls the
+        // deliver handler for it once the lock is released, so the response handler runs without it
+        p_csp_params->p_pending_pkt = p_client_resp_pkt;
 
-        // try to dispatch the received packet
-        if (true == fp_disp_execute(FP_CFG_CSP_CTX((fp_dispatch_info_t *)&disp_ctx)))
-        {
-            csp_buffer_free(p_client_resp_pkt);
-
-            // Close the connection after receiving a response
-            (void)csp_close(p_csp_params->p_active_conn);
-            p_csp_params->p_active_conn = NULL;
-
-            // Return true to indicate the session can be closed
-            return FP_DISP_TRACK_ACTION_CLOSE_SESSION;
-        }
-        else
-        {
-            ES_TRACE_DEBUG("<A< unexpected packet from node addr '%u:%u' - dispatch failed (session still open)",
-                            csp_conn_src(p_csp_params->p_active_conn),
-                            csp_conn_sport(p_csp_params->p_active_conn));
-
-            // just release the packet buffer but keep the connection open (this is not our expected response)
-            // session timeout will continue to be tracked
-            csp_buffer_free(p_client_resp_pkt);
-        }
+        return FP_DISP_TRACK_ACTION_DELIVER;
     }
 
+    return FP_DISP_TRACK_ACTION_KEEP_SESSION_ACTIVE;
+}
+
+static fp_session_track_action_t fp_csp_binder_session_deliver_handler(fp_disp_session_base_t *const p_sess)
+{
+    CRIT_ASSERT(NULL != p_sess);
+
+    fp_csp_binder_params_t *p_csp_params = (fp_csp_binder_params_t *)p_sess->p_comm_params;
+
+    if ((NULL == p_csp_params) || (NULL == p_csp_params->p_pending_pkt))
+    {
+        return FP_DISP_TRACK_ACTION_KEEP_SESSION_ACTIVE;
+    }
+
+    csp_packet_t *p_client_resp_pkt = p_csp_params->p_pending_pkt;
+    p_csp_params->p_pending_pkt     = NULL;
+
+    // Create dispatch context for the received packet
+    fp_dispatch_info_t disp_ctx = { 0 };
+    disp_ctx.data_size     = p_client_resp_pkt->length;
+    disp_ctx.p_data        = p_client_resp_pkt->data;
+    disp_ctx.p_comm_params = (void *)p_csp_params;
+
+    // try to dispatch the received packet (runs the application's response handler)
+    bool dispatched = fp_disp_execute(FP_CFG_CSP_CTX((fp_dispatch_info_t *)&disp_ctx));
+
+    csp_buffer_free(p_client_resp_pkt);
+
+    if (true == dispatched)
+    {
+        // the session close calls fp_csp_binder_session_close_handler, which closes the connection
+        return FP_DISP_TRACK_ACTION_CLOSE_SESSION;
+    }
+
+    ES_TRACE_DEBUG("<A< unexpected packet from node addr '%u:%u' - dispatch failed (session still open)",
+                   csp_conn_src(p_csp_params->p_active_conn),
+                   csp_conn_sport(p_csp_params->p_active_conn));
+
+    // not our expected response: keep the connection open; the session timeout is still tracked
     return FP_DISP_TRACK_ACTION_KEEP_SESSION_ACTIVE;
 }
 
@@ -188,10 +229,17 @@ static void fp_csp_binder_session_close_handler(fp_disp_session_base_t *const p_
 
     fp_csp_binder_params_t *p_csp_params = (fp_csp_binder_params_t *)p_sess->p_comm_params;
 
-    // Close any active CSP connection associated with this session
+    // Close any active CSP connection associated with this session (the only place that closes it)
     if (NULL != p_csp_params && NULL != p_csp_params->p_active_conn)
     {
         (void)csp_close(p_csp_params->p_active_conn);
         p_csp_params->p_active_conn = NULL;
+    }
+
+    // free a parked response that was never delivered
+    if (NULL != p_csp_params && NULL != p_csp_params->p_pending_pkt)
+    {
+        csp_buffer_free(p_csp_params->p_pending_pkt);
+        p_csp_params->p_pending_pkt = NULL;
     }
 }

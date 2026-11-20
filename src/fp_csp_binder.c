@@ -433,8 +433,9 @@ fp_cmd_status_t fp_csp_binder_req_sync(const fp_frame_type_t frame_type, fp_csp_
         return hook_res;
     }
 
-    // ensure the connection is always NULL for client requests
+    // ensure the connection and the pending response are always NULL for client requests
     p_csp_params->p_active_conn = NULL;
+    p_csp_params->p_pending_pkt = NULL;
 
     p_csp_params->timeout = timeout;
 
@@ -462,8 +463,9 @@ fp_cmd_status_t fp_csp_binder_req_async(const fp_frame_type_t frame_type, fp_csp
         return hook_res;
     }
 
-    // ensure the connection is always NULL for client requests
+    // ensure the connection and the pending response are always NULL for client requests
     p_csp_params->p_active_conn = NULL;
+    p_csp_params->p_pending_pkt = NULL;
 
     p_csp_params->timeout = timeout;
 

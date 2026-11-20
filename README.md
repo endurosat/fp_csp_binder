@@ -19,7 +19,7 @@ fp_csp_binder is source-available under the [EnduroSat Software License](LICENSE
 
 ## Requirements
 
-- [fp](https://github.com/endurosat/fp) 1.4.0 or later (CMake target `svc_fp`), with its host
+- [fp](https://github.com/endurosat/fp) 1.5.1 or later (CMake target `svc_fp`), with its host
   configuration target `svc_fp_cfg` (see the fp README)
 - [csp-es](https://github.com/endurosat/csp-es) 1.4.0 or later (CMake target `csp_es`)
 - CMake 3.20 or later (required by csp-es) and a C11 compiler
@@ -188,6 +188,8 @@ bool app_fp_init(void)
 Then call `fp_disp_session_mgr_track_sessions(p_sys_ctx)` periodically from a task, every few
 milliseconds. It delivers the responses of asynchronous requests to their callbacks, times them out,
 and disarms ARM-and-FIRE sessions that were never fired. Without it, asynchronous callbacks never run.
+The callbacks run on that task, without any FP lock held: the binder only reads a response while the
+tracker holds the client-session lock, and dispatches it after the lock is released.
 
 ## Building and testing
 
@@ -196,9 +198,12 @@ The functional tests build the library on Linux together with `fp` and `csp-es` 
 1. **Initialisation test** (`fp_client`): initialises CSP with a ZMQ interface and the binder, and
    starts the binder's server threads.
 2. **Adversarial tests** (`fp_adversarial`): a server and a client in one process over the CSP
-   loopback interface. Each case injects a stray CSP frame while a request is waiting, and checks
-   that the client accepts only the response from the addressed node (spoofing, synchronous and
-   asynchronous paths) and that a stray frame does not end the synchronous wait early.
+   loopback interface. T1–T3 and T8 inject a stray CSP frame while a request is waiting, and check
+   that the client accepts only the response from the addressed node and that a stray frame does
+   not end the request early. T4, T5 and T7 check that each connection is closed exactly once and
+   that the asynchronous callbacks run without the client-session lock. T6 checks that a server
+   thread reports alive to the task monitor during a continuous stream of requests. T9 and T10
+   check that the session close frees a parked response once and never a stale `p_pending_pkt`.
 
 Requirements: CMake 3.20 or later, GCC and G++ (the `fp` build needs a C++ compiler), make, git,
 pkg-config, CA certificates for the HTTPS clones, and the libzmq development package. libcjson is
@@ -239,13 +244,14 @@ Header: `fp_csp_binder.h`
 ```c
 /* Connection parameters — fill this in before every call */
 typedef struct {
-    uint8_t     prio;          /* CSP message priority (e.g. CSP_PRIO_NORM) */
-    uint16_t    dest;          /* destination node address */
-    uint8_t     dport;         /* destination node port */
-    uint32_t    timeout;       /* milliseconds to wait; overwritten by the binder */
-    uint32_t    opts;          /* connection options (e.g. CSP_O_CRC32) */
-    csp_conn_t *p_active_conn; /* leave NULL — the binder owns this field; reading it is fine */
-    void       *p_user_args;   /* optional: pass anything you need in callbacks */
+    uint8_t       prio;          /* CSP message priority (e.g. CSP_PRIO_NORM) */
+    uint16_t      dest;          /* destination node address */
+    uint8_t       dport;         /* destination node port */
+    uint32_t      timeout;       /* milliseconds to wait; overwritten by the binder */
+    uint32_t      opts;          /* connection options (e.g. CSP_O_CRC32) */
+    csp_conn_t   *p_active_conn; /* leave NULL — the binder owns this field */
+    void         *p_user_args;   /* optional: pass anything you need in callbacks */
+    csp_packet_t *p_pending_pkt; /* leave NULL — the binder owns this field */
 } fp_csp_binder_params_t;
 
 /* Dispatch context — zero-initialise it and pass its address; the binder attaches
@@ -355,14 +361,17 @@ fp_cmd_status_t my_service_read_value(uint32_t *p_out_value)
 
 Use this form when you do not need to block the calling task, for example when periodically polling telemetry from several nodes in a loop. The call returns immediately; the response arrives later in a callback you provide.
 
-Because the call returns before the reply is received, the `fp_csp_binder_params_t` and `fp_dispatch_info_t` **must remain valid until the callback fires**. The usual pattern is to keep these in a small pre-allocated pool and use an `in_use` flag — set before the call, cleared in the callback — to prevent a slot from being reused too early. The flag alone is not enough: the callback runs **before** the binder closes the CSP connection and clears `p_active_conn`. A slot reused in that window loses its connection, which then stays open for good. Treat a slot as free only when `in_use` is false **and** `p_active_conn` is `NULL`.
+Because the call returns before the reply is received, the `fp_csp_binder_params_t` and `fp_dispatch_info_t` **must remain valid until the request is released**. The usual pattern is to keep these in a small pre-allocated pool with an `in_use` flag, set before the call and cleared in the **release handler** (`fp_dispatch_info_t::p_on_released`, from fp). FP calls the release handler once per accepted request, after the binder has closed the CSP connection; from that call on, the slot may be reused. The response handler runs earlier, while the connection is still open, so it must not free the slot.
+
+Both handlers run on the task that calls `fp_disp_session_mgr_track_sessions()`, without any FP lock held. They may take application locks and send further FP requests.
 
 #### Async request steps
 
-1. Obtain a free slot from a pool that holds `fp_csp_binder_params_t`, `fp_dispatch_info_t`, and an `in_use` flag. Free means `in_use` is false and `csp_params.p_active_conn` is `NULL`.
-2. Fill the slot's `csp_params`; set `p_user_args` to point to the `in_use` flag.
-3. Call `fp_csp_binder_req_async`, passing `&p_ctx->disp_ctx` as the dispatch context argument, and the response handler callback.
-4. In the callback: process the response, then clear the `in_use` flag. The binder closes the connection and clears `p_active_conn` after the callback returns; only then is the slot free.
+1. Obtain a free slot (`in_use` false) from a pool that holds `fp_csp_binder_params_t`, `fp_dispatch_info_t`, and an `in_use` flag.
+2. Zero the slot's dispatch context, fill its `csp_params`, and set `p_user_args` to point to the `in_use` flag.
+3. Set `disp_ctx.p_on_released` to the release handler.
+4. Call `fp_csp_binder_req_async`, passing `&p_ctx->disp_ctx` as the dispatch context argument, and the response handler callback.
+5. In the response handler: process the response. In the release handler: clear the `in_use` flag.
 
 #### Pool element definition
 
@@ -375,7 +384,7 @@ typedef struct {
 } my_csp_ctx_t;
 
 #define MY_POOL_SIZE 4u
-/* Static storage, so zero-initialised: every slot starts free (in_use false, p_active_conn NULL).
+/* Static storage, so zero-initialised: every slot starts free.
  * A pool on the stack or heap must be zeroed before first use. */
 static my_csp_ctx_t ctx_pool[MY_POOL_SIZE];
 
@@ -383,12 +392,7 @@ static my_csp_ctx_t *get_free_slot(void)
 {
     for (uint8_t i = 0; i < MY_POOL_SIZE; i++)
     {
-        /* in_use alone is not enough: the binder clears p_active_conn only
-         * after the callback, once it has closed the connection. On a
-         * single-core target the unlocked read is safe: a stale non-NULL value
-         * only makes the slot look busy. On a multi-core host, read both
-         * fields atomically or under a lock. */
-        if (!ctx_pool[i].in_use && (NULL == ctx_pool[i].csp_params.p_active_conn))
+        if (!ctx_pool[i].in_use)
         {
             return &ctx_pool[i];
         }
@@ -397,9 +401,9 @@ static my_csp_ctx_t *get_free_slot(void)
 }
 ```
 
-#### Response handler callback
+#### Response handler and release handler
 
-The callback signature must match `fp_generic_response_handler_t`:
+The response handler signature must match `fp_generic_response_handler_t`, the release handler `fp_session_released_handler_t`:
 
 ```c
 void my_service_telemetry_handler(fp_dispatch_info_t            *p_disp_ctx,
@@ -408,20 +412,20 @@ void my_service_telemetry_handler(fp_dispatch_info_t            *p_disp_ctx,
 {
     if (FP_CMD_STATUS_NOERROR == cmd_status && NULL != p_resp)
     {
-        /* process p_resp fields here */
+        /* process p_resp fields here; the slot is still in use */
         (void)p_resp->temperature;
         (void)p_resp->voltage;
     }
+}
 
-    /* Release the pool slot; it is reusable once the binder has also cleared p_active_conn */
-    if (NULL != p_disp_ctx && NULL != p_disp_ctx->p_comm_params)
+/* Called once, after the binder has closed the connection: the slot is free again */
+void my_service_telemetry_released(void *p_comm_params)
+{
+    fp_csp_binder_params_t *p_csp = p_comm_params;
+    if (NULL != p_csp && NULL != p_csp->p_user_args)
     {
-        fp_csp_binder_params_t *p_csp = p_disp_ctx->p_comm_params;
-        if (NULL != p_csp->p_user_args)
-        {
-            bool *p_in_use = p_csp->p_user_args;
-            *p_in_use = false;
-        }
+        bool *p_in_use = p_csp->p_user_args;
+        *p_in_use = false;
     }
 }
 ```
@@ -438,8 +442,9 @@ void my_service_poll_telemetry(void)
         return;
     }
 
-    /* Step 1 — mark slot busy */
+    /* Step 1 — mark slot busy, start from a zeroed dispatch context */
     p_ctx->in_use = true;
+    memset(&p_ctx->disp_ctx, 0, sizeof(p_ctx->disp_ctx));
 
     /* Step 2 — connection parameters */
     p_ctx->csp_params.prio          = CSP_PRIO_NORM;
@@ -447,10 +452,12 @@ void my_service_poll_telemetry(void)
     p_ctx->csp_params.dport         = MY_DEST_PORT;
     p_ctx->csp_params.timeout       = MY_TIMEOUT_MS;
     p_ctx->csp_params.opts          = CSP_O_CRC32;
-    p_ctx->csp_params.p_active_conn = NULL;             /* already NULL: get_free_slot only returns closed slots */
-    p_ctx->csp_params.p_user_args   = &p_ctx->in_use;  /* callback uses this to free the slot */
+    p_ctx->csp_params.p_user_args   = &p_ctx->in_use;  /* the release handler uses this to free the slot */
 
-    /* Step 3 — non-blocking call */
+    /* Step 3 — release handler */
+    p_ctx->disp_ctx.p_on_released = &my_service_telemetry_released;
+
+    /* Step 4 — non-blocking call */
     fp_cmd_status_t status = fp_csp_binder_req_async(
         FP_FRAME_TYPE_REQ,
         &p_ctx->csp_params,
@@ -462,7 +469,7 @@ void my_service_poll_telemetry(void)
 
     if (FP_CMD_STATUS_NOERROR != status)
     {
-        /* send failed — release the slot immediately */
+        /* not accepted — the release handler will not run: release the slot here */
         p_ctx->in_use = false;
     }
 }
@@ -526,7 +533,7 @@ fp_cmd_status_t my_service_broadcast_status(uint32_t status_code)
 
 ### Common pitfalls
 
-- **Leave `p_active_conn = NULL`.** The binder owns this field: it resets it on every call and uses it while a request is in progress. Do not write it while an asynchronous request is pending. Reading it to check that a pool slot is free is expected (see `get_free_slot`).
+- **Leave `p_active_conn` and `p_pending_pkt` NULL.** The binder owns these fields: it resets them on every call and uses them while a request is in progress. Do not write them while an asynchronous request is pending; free a pool slot in the release handler instead of checking them.
 
 - **Check the return value of every call.**
   - `FP_CMD_STATUS_SENDERR`: the request could not be sent (for example no CSP buffer or connection), or a synchronous request got no valid response before the timeout.
@@ -534,7 +541,7 @@ fp_cmd_status_t my_service_broadcast_status(uint32_t status_code)
   - `FP_CMD_STATUS_NO_MEM`: no free FP client session; raise `MAX_CLIENT_SESSIONS_COUNT` in `fp_config.h` if requests overlap.
   - `FP_CMD_STATUS_INVARGS`: `p_csp_params`, the request function or `p_disp_ctx` is NULL. This is only returned if `BREAK_ASSERT` does not halt.
 
-- **Async: keep the pool slot alive until the callback.** Once `fp_csp_binder_req_async` returns `FP_CMD_STATUS_NOERROR`, do not touch or reuse the slot until the callback clears the `in_use` flag **and** the binder clears `p_active_conn`; check both, as `get_free_slot` above does. If the call fails, clear the flag immediately (as shown above). The callback runs only if your application calls `fp_disp_session_mgr_track_sessions()` periodically (see [Initialisation](#initialisation)).
+- **Async: keep the pool slot alive until the release handler.** Once `fp_csp_binder_req_async` returns `FP_CMD_STATUS_NOERROR`, do not touch or reuse the slot until the release handler has cleared the `in_use` flag. If the call fails, clear the flag immediately (as shown above). Both handlers run only if your application calls `fp_disp_session_mgr_track_sessions()` periodically (see [Initialisation](#initialisation)).
 
 - **Synchronous calls can use the stack.** A local `fp_csp_binder_params_t` and `fp_dispatch_info_t` are fine for synchronous and broadcast calls, because the call returns only when it is done. Asynchronous calls need storage that outlives the call, such as the pool described above.
 

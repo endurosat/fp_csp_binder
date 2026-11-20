@@ -91,7 +91,10 @@ It passes if every step succeeds. No FP request is sent.
 ### Test 2: Adversarial (`fp_adversarial`)
 
 Runs an FP server and client in one process over the CSP loopback interface (no ZMQ proxy needed).
-T1 to T3 inject one stray CSP frame while a request is waiting:
+T1–T3 and T8 each inject one stray CSP frame while a request is waiting; T4, T5 and T7 check how
+connections are closed and that the asynchronous callbacks run without the client-session lock;
+T6 checks the alive indications of a server thread; T9 and T10 check how the session close handles
+the `p_pending_pkt` field:
 
 - **T1, synchronous spoofing**: a frame from another node must not be accepted as the response.
 - **T2, synchronous stray frame**: a frame with a wrong command ID must not end the wait; the
@@ -100,13 +103,27 @@ T1 to T3 inject one stray CSP frame while a request is waiting:
 - **T4, synchronous close**: a synchronous request must close its connection exactly once. The
   test wraps `csp_connect`, `csp_accept` and `csp_close` (linker `--wrap`) and counts a close of
   a connection that is not open as a double close.
-- **T5, asynchronous slot reuse** (T5a reply, T5b timeout): the rule an application pool relies on.
-  The callback runs while the connection is still open; afterwards the binder closes it exactly once
-  and only then clears `p_active_conn`, within 500 ms.
+- **T5, asynchronous close** (T5a reply, T5b timeout): the callback runs while the connection is
+  still open; afterwards the binder closes it exactly once and only then clears `p_active_conn`,
+  within 500 ms. An application pool frees its slot in fp's release handler (see T7), not by
+  checking this field.
 - **T6, server alive indication**: 200 requests, 10 ms apart, on one connection keep the UDP server
   thread in its 50 ms read loop for 2 s. The thread must give the task monitor one alive indication
   per handled packet. The test counts the indications through the hook that
   `TASK_MONITOR_ALIVE_INDICATION` calls in `config/fp_csp_binder_cfg.h`.
+- **T7, asynchronous callbacks without the lock** (T7a reply, T7b timeout): the response handler
+  and the release handler run without the client-session lock (a probe thread takes it while each
+  handler waits), and the release handler runs once, after the connection is closed, with the
+  request's connection parameters.
+- **T8, asynchronous stray frame from the addressed node**: a frame from the server node with a
+  wrong command ID is dropped and freed, the request stays open, and the real reply is then
+  delivered exactly once. Needs fp 1.5.1 or later.
+- **T9, synchronous request with a stale `p_pending_pkt`**: the request's parameters are set field
+  by field, as a caller that bypasses `fp_csp_binder_req_sync` does, and `p_pending_pkt` points to a
+  CSP buffer the test still owns. The session close must not free that buffer.
+- **T10, session closed with a response still parked**: the test opens a client session through
+  fp's session manager, parks a CSP buffer in `p_pending_pkt` and closes the session. The close must
+  free the buffer once and close the connection once.
 
 ## Dependencies
 
@@ -123,8 +140,9 @@ System dependencies (checked, not installed, by the scripts):
 
 ## Environment Variables
 
-- `CSP_ES_VERSION`, `FP_VERSION`: release tags to clone (default: `1.4.0`). A dependency that is
-  already cloned is reused, so remove the dependencies directory after changing a version.
+- `CSP_ES_VERSION`, `FP_VERSION`: release tags to clone (defaults: `1.4.0` and `1.5.1`). A
+  dependency that is already cloned is reused, so remove the dependencies directory after changing
+  a version.
 - `DEPS_DIR`, `BUILD_DIR`: base directories for dependencies and build output (default: the current
   directory). `build.sh`, `run_tests.sh` and `cleanup.sh` use `$DEPS_DIR/deps` and
   `$BUILD_DIR/build`; `setup_environment.sh` takes the base directory as its first argument
